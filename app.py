@@ -1,170 +1,270 @@
+
 import streamlit as st
 import pandas as pd
 import numpy as np
 import yfinance as yf
+from datetime import datetime
 
-st.set_page_config(page_title="VIX Swing Live", page_icon="📊", layout="centered")
-st.markdown("""
+st.set_page_config(page_title="VIX Swing Live", page_icon="🎮", layout="centered")
+
+st.markdown('''
 <style>
-.block-container{max-width:820px;padding-top:2rem}
-.signal{padding:22px;border-radius:18px;text-align:center;margin:18px 0}
-.strongshort{background:#ffdede}.shortwatch{background:#fff0df}
-.wait{background:#fff7cf}.longwatch{background:#e6f5ff}.stronglong{background:#dcf7e7}
-.signal h1{margin:0;font-size:42px}.signal p{margin:8px 0 0}
-</style>""", unsafe_allow_html=True)
+:root{
+  --bg:#07131f; --card:#0b1f31; --line:#184869; --txt:#f3f7fb; --muted:#9eb2c4;
+}
+html, body, [class*="css"] {background:var(--bg); color:var(--txt);}
+.stApp{background:linear-gradient(180deg,#07131f 0%,#081725 100%);}
+.block-container{max-width:840px;padding-top:1rem;padding-bottom:2rem;}
+h1,h2,h3{color:var(--txt)!important;}
+.small-muted{color:var(--muted);font-size:.88rem}
+.hero{background:linear-gradient(135deg,#0b1d2e,#102941);border:1px solid var(--line);border-radius:22px;padding:18px;margin-bottom:16px;box-shadow:0 10px 30px rgba(0,0,0,.25)}
+.signal{border-radius:22px;padding:22px 18px;text-align:center;border:1px solid rgba(255,255,255,.08);margin:12px 0 14px}
+.strongshort{background:linear-gradient(135deg,#4a1218,#2a1115)}
+.shortwatch{background:linear-gradient(135deg,#4a2b0b,#2a1d0d)}
+.wait{background:linear-gradient(135deg,#4a430d,#2a270d)}
+.longwatch{background:linear-gradient(135deg,#0b304a,#0d2230)}
+.stronglong{background:linear-gradient(135deg,#0b4328,#0d2b20)}
+.signal-title{font-size:2.35rem;font-weight:900;line-height:1.05}
+.signal-sub{margin-top:8px;color:#e7edf4}
+.meter{display:grid;grid-template-columns:repeat(5,1fr);gap:6px;margin-top:14px}
+.meter > div{padding:8px 4px;border-radius:12px;text-align:center;font-size:.72rem;border:1px solid rgba(255,255,255,.06);opacity:.6;background:#0a1a28}
+.active{opacity:1!important;box-shadow:0 0 18px rgba(255,255,255,.12)}
+.metric-card{background:linear-gradient(180deg,#0b1f31,#0a1a28);border:1px solid var(--line);border-radius:18px;padding:14px;min-height:142px;margin-bottom:10px}
+.metric-name{color:#dbe7f1;font-weight:800;font-size:.95rem}
+.metric-val{font-size:1.85rem;font-weight:900;margin:6px 0}
+.metric-desc{color:var(--muted);font-size:.82rem;line-height:1.35}
+.tag{display:inline-block;padding:4px 9px;border-radius:999px;font-size:.75rem;font-weight:800;margin-top:6px}
+.tag-green{background:#103d2a;color:#6ff0aa}.tag-blue{background:#10344d;color:#74caff}.tag-yellow{background:#4b4015;color:#ffe077}.tag-orange{background:#4b2d11;color:#ffb66b}.tag-red{background:#4a171b;color:#ff858b}
+.panel{background:linear-gradient(180deg,#0b1f31,#0a1a28);border:1px solid var(--line);border-radius:18px;padding:16px;margin:12px 0}
+.checkrow{padding:7px 0;border-bottom:1px solid rgba(255,255,255,.06)}
+.scorebox{display:flex;justify-content:space-between;gap:12px;align-items:center;background:#091827;border:1px solid var(--line);border-radius:16px;padding:14px}
+.scorepill{min-width:90px;text-align:center;padding:10px;border-radius:14px;background:#0f2740;font-size:1.25rem;font-weight:900}
+.stButton>button{width:100%;border-radius:14px;border:1px solid #1f6fa0;background:#0c2d46;color:white;font-weight:800;padding:.7rem 1rem}
+</style>
+''', unsafe_allow_html=True)
 
-@st.cache_data(ttl=300)
-def hist(ticker, period="6mo"):
-    x = yf.download(ticker, period=period, interval="1d", auto_adjust=False,
-                    progress=False, threads=False)
-    if isinstance(x.columns, pd.MultiIndex):
-        x.columns = x.columns.get_level_values(0)
-    return x.dropna()
-
-def close_series(df):
-    c = df["Close"]
-    if isinstance(c, pd.DataFrame): c = c.iloc[:,0]
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_series(ticker, period="6mo"):
+    df = yf.download(ticker, period=period, interval="1d", auto_adjust=False, progress=False, threads=False)
+    if df is None or df.empty:
+        return None
+    if isinstance(df.columns, pd.MultiIndex):
+        if "Close" in df.columns.get_level_values(0):
+            c = df["Close"]
+            if isinstance(c, pd.DataFrame):
+                c = c.iloc[:, 0]
+        else:
+            c = df.iloc[:, 0]
+    else:
+        c = df["Close"]
     return c.astype(float).dropna()
 
-def rsi(s, n=14):
-    d=s.diff(); up=d.clip(lower=0).ewm(alpha=1/n,adjust=False).mean()
-    dn=(-d.clip(upper=0)).ewm(alpha=1/n,adjust=False).mean()
-    return 100-(100/(1+up/dn.replace(0,np.nan)))
+def ema(s, n):
+    return float(s.ewm(span=n, adjust=False).mean().iloc[-1])
 
-def get_one(candidates):
-    for t in candidates:
-        try:
-            d=hist(t)
-            if len(d)>25: return t, close_series(d)
-        except: pass
-    return None, None
+def pctn(s, n):
+    return float((s.iloc[-1] / s.iloc[-1-n] - 1) * 100) if s is not None and len(s) > n else np.nan
 
-st.title("VIX Swing Live")
-st.caption("מסנן סביבת שוק לעסקאות קצרות של 2–3 ימי מסחר. VIX הוא מסנן — לא טריגר כניסה עצמאי.")
+def calc_rsi(s, n=14):
+    d = s.diff()
+    up = d.clip(lower=0)
+    dn = -d.clip(upper=0)
+    au = up.ewm(alpha=1/n, adjust=False).mean()
+    ad = dn.ewm(alpha=1/n, adjust=False).mean()
+    rs = au / ad.replace(0, np.nan)
+    return float((100 - 100/(1+rs)).iloc[-1])
+
+def badge(text, cls):
+    return f'<span class="tag {cls}">{text}</span>'
+
+st.markdown('<div class="hero"><div style="font-size:2rem;font-weight:900">🎮 VIX Swing Live</div><div class="small-muted">משחק פשוט של Risk-On / Risk-Off לעסקאות קצרות של 2–3 ימי מסחר</div></div>', unsafe_allow_html=True)
 
 if st.button("🔄 רענן נתונים", use_container_width=True):
-    st.cache_data.clear(); st.rerun()
+    st.cache_data.clear()
+    st.rerun()
 
-market_name=st.radio("מדד לניתוח",["Nasdaq 100","S&P 500"],horizontal=True)
-market_ticker="^NDX" if market_name=="Nasdaq 100" else "^GSPC"
+market_name = st.radio("מדד לניתוח", ["Nasdaq 100", "S&P 500"], horizontal=True)
+market_ticker = "^NDX" if market_name == "Nasdaq 100" else "^GSPC"
 
-try:
-    _,v=get_one(["^VIX"]); _,v9=get_one(["^VIX9D"])
-    _,v3=get_one(["^VIX3M"]); _,vv=get_one(["^VVIX"])
-    _,m=get_one([market_ticker])
-    if any(x is None for x in [v,v9,v3,m]): raise ValueError("missing market series")
+with st.spinner("טוען נתוני שוק..."):
+    v = fetch_series("^VIX")
+    v9 = fetch_series("^VIX9D")
+    v3 = fetch_series("^VIX3M")
+    vv = fetch_series("^VVIX")
+    m = fetch_series(market_ticker)
 
-    V=float(v.iloc[-1]); V9=float(v9.iloc[-1]); V3=float(v3.iloc[-1])
-    VV=float(vv.iloc[-1]) if vv is not None else np.nan
-    e5=float(v.ewm(span=5,adjust=False).mean().iloc[-1])
-    e10=float(v.ewm(span=10,adjust=False).mean().iloc[-1])
-    vrsi=float(rsi(v).iloc[-1])
-    c1=(V/float(v.iloc[-2])-1)*100
-    c5=(V/float(v.iloc[-6])-1)*100
-    me20=float(m.ewm(span=20,adjust=False).mean().iloc[-1])
-    M=float(m.iloc[-1]); m2=(M/float(m.iloc[-3])-1)*100; m5=(M/float(m.iloc[-6])-1)*100
-    ratio9=V9/V; ratio3=V/V3
+if any(x is None or len(x) < 25 for x in [v, v9, v3, m]):
+    st.error("לא הצלחתי למשוך כרגע את כל הנתונים הדרושים. נסה רענון בעוד רגע.")
+    st.stop()
 
-    a,b,c=st.columns(3)
-    a.metric("VIX",f"{V:.2f}",f"{c1:+.2f}%")
-    b.metric("VIX9D",f"{V9:.2f}")
-    c.metric("VIX3M",f"{V3:.2f}")
-    st.caption(f"VVIX: {VV:.1f} · VIX EMA5: {e5:.2f} · EMA10: {e10:.2f} · RSI: {vrsi:.0f}")
+V=float(v.iloc[-1]); V9=float(v9.iloc[-1]); V3=float(v3.iloc[-1])
+VV=float(vv.iloc[-1]) if vv is not None and len(vv) else np.nan
+VE5=ema(v,5); VE10=ema(v,10); VRSI=calc_rsi(v)
+C1=pctn(v,1); C5=pctn(v,5)
+M=float(m.iloc[-1]); ME5=ema(m,5); ME20=ema(m,20); M2=pctn(m,2); M5=pctn(m,5)
+R9=V9/V; R3=V/V3
 
-    # Positive = risk-off / favors equity short.
-    s=0.0; reasons=[]
-    def add(points,text):
-        nonlocal_dummy = None
-        return points,text
+score=0.0
+reasons=[]
+def add(points, text):
+    global score
+    score += points
+    reasons.append((points, text))
 
-    if V>e5: s+=1.2; reasons.append(("+1.20","VIX מעל EMA5"))
-    else: s-=1.2; reasons.append(("-1.20","VIX מתחת EMA5"))
-    if e5>e10: s+=1.0; reasons.append(("+1.00","EMA5 מעל EMA10"))
-    else: s-=1.0; reasons.append(("-1.00","EMA5 מתחת EMA10"))
+if V>VE5: add(1.2,"VIX מעל EMA5")
+else: add(-1.2,"VIX מתחת EMA5")
+if VE5>VE10: add(1.0,"EMA5 של VIX מעל EMA10")
+else: add(-1.0,"EMA5 של VIX מתחת EMA10")
 
-    if ratio9>=1.03: s+=1.4; reasons.append(("+1.40","VIX9D בפרמיה מעל VIX"))
-    elif ratio9<=0.97: s-=1.0; reasons.append(("-1.00","VIX9D מתחת VIX"))
-    else: reasons.append(("0.00","VIX9D/VIX ניטרלי"))
+if R9>=1.03: add(1.4,"VIX9D בפרמיה — לחץ קצר־טווח")
+elif R9<=0.97: add(-1.0,"VIX9D נמוך מ־VIX")
+else: reasons.append((0.0,"VIX9D/VIX מאוזן"))
 
-    if c1>=8: s+=1.4; reasons.append(("+1.40","זינוק VIX יומי ≥8%"))
-    elif c1>=3: s+=0.7; reasons.append(("+0.70","VIX עולה ≥3% ביום"))
-    elif c1<=-8: s-=1.4; reasons.append(("-1.40","VIX יורד ≥8% ביום"))
-    elif c1<=-3: s-=0.7; reasons.append(("-0.70","VIX יורד ≥3% ביום"))
+if C1>=8: add(1.4,"זינוק יומי ב־VIX ≥ 8%")
+elif C1>=3: add(0.7,"VIX עולה ≥ 3% ביום")
+elif C1<=-8: add(-1.4,"ירידה יומית ב־VIX ≥ 8%")
+elif C1<=-3: add(-0.7,"VIX יורד ≥ 3% ביום")
 
-    if c5>=10: s+=1.2; reasons.append(("+1.20","VIX עלה ≥10% ב־5 ימים"))
-    elif c5>=4: s+=0.7; reasons.append(("+0.70","VIX עלה ≥4% ב־5 ימים"))
-    elif c5<=-10: s-=1.2; reasons.append(("-1.20","VIX ירד ≥10% ב־5 ימים"))
-    elif c5<=-4: s-=0.7; reasons.append(("-0.70","VIX ירד ≥4% ב־5 ימים"))
+if C5>=10: add(1.2,"VIX עלה ≥ 10% ב־5 ימים")
+elif C5>=4: add(0.7,"VIX עלה ≥ 4% ב־5 ימים")
+elif C5<=-10: add(-1.2,"VIX ירד ≥ 10% ב־5 ימים")
+elif C5<=-4: add(-0.7,"VIX ירד ≥ 4% ב־5 ימים")
 
-    # Term structure: stronger confirmation only when the front end actually inverts.
-    if ratio3>=1.02: s+=1.35; reasons.append(("+1.35","VIX מעל VIX3M — לחץ/Backwardation"))
-    elif ratio3<=0.94: s-=0.45; reasons.append(("-0.45","Contango ברור — מוריד עוצמת SHORT"))
+if R3>=1.02: add(1.35,"VIX מעל VIX3M — לחץ חזק")
+elif R3<=0.94: add(-0.45,"Contango ברור — שוק פחות לחוץ")
+else: reasons.append((0.0,"VIX/VIX3M באמצע"))
 
-    if M<me20: s+=1.0; reasons.append(("+1.00",f"{market_name} מתחת EMA20"))
-    else: s-=1.0; reasons.append(("-1.00",f"{market_name} מעל EMA20"))
-    if m2<=-0.5: s+=1.0; reasons.append(("+1.00","מומנטום 2 ימים שלילי"))
-    elif m2>=0.5: s-=1.0; reasons.append(("-1.00","מומנטום 2 ימים חיובי"))
-    if m5<=-1.0: s+=0.6; reasons.append(("+0.60","מומנטום 5 ימים שלילי"))
-    elif m5>=1.0: s-=0.6; reasons.append(("-0.60","מומנטום 5 ימים חיובי"))
+if M<ME20: add(1.0,f"{market_name} מתחת EMA20")
+else: add(-1.0,f"{market_name} מעל EMA20")
+if M<ME5: add(0.45,f"{market_name} מתחת EMA5")
+else: add(-0.45,f"{market_name} מעל EMA5")
 
-    if vrsi>=60: s+=0.35; reasons.append(("+0.35","RSI VIX תומך בעלייה"))
-    elif vrsi<=40: s-=0.35; reasons.append(("-0.35","RSI VIX תומך בירידה"))
+if M2<=-0.5: add(1.0,"מומנטום 2 ימים שלילי")
+elif M2>=0.5: add(-1.0,"מומנטום 2 ימים חיובי")
+if M5<=-1.0: add(0.6,"מומנטום 5 ימים שלילי")
+elif M5>=1.0: add(-0.6,"מומנטום 5 ימים חיובי")
 
-    # VVIX is confirmation, not a standalone trigger.
-    if not np.isnan(VV):
-        if VV>=115: s+=0.55; reasons.append(("+0.55","VVIX גבוה — אי־ודאות גבוהה"))
-        elif VV<85: s-=0.25; reasons.append(("-0.25","VVIX נמוך"))
+if VRSI>=60: add(0.35,"RSI VIX תומך בעלייה")
+elif VRSI<=40: add(-0.35,"RSI VIX תומך בירידה")
 
-    # Five-state mapping. Strong states require both score AND structural confirmation.
-    short_struct = (ratio9>=1.0 and ratio3>=0.98 and V>e5 and M<me20)
-    long_struct  = (ratio9<=1.0 and ratio3<=0.96 and V<e5 and M>me20)
+if not np.isnan(VV):
+    if VV>=115: add(0.55,"VVIX גבוה — אי־ודאות גבוהה")
+    elif VV<85: add(-0.25,"VVIX נמוך")
 
-    if s>=5.0 and short_struct:
-        label="🔴 STRONG SHORT"; css="strongshort"
-        note="סביבת Risk-Off מסונכרנת. עדיין נכנסים רק אחרי טריגר מחיר."
-    elif s>=2.5:
-        label="🟠 SHORT WATCH"; css="shortwatch"
-        note="יש נטייה לשורט, אבל חסר סנכרון מלא. חפש אישור — לא כניסה אוטומטית."
-    elif s<=-5.0 and long_struct:
-        label="🟢 STRONG LONG"; css="stronglong"
-        note="סביבת Risk-On מסונכרנת. עדיין נכנסים רק אחרי טריגר מחיר."
-    elif s<=-2.5:
-        label="🔵 LONG WATCH"; css="longwatch"
-        note="יש נטייה ללונג, אבל חסר סנכרון מלא. חפש אישור — לא כניסה אוטומטית."
-    else:
-        label="🟡 WAIT"; css="wait"
-        note="אין כרגע יתרון מספיק ברור לעסקה קצרה."
+short_struct=(R9>=1.00 and R3>=0.98 and V>VE5 and M<ME20)
+long_struct=(R9<=1.00 and R3<=0.96 and V<VE5 and M>ME20)
 
-    st.markdown(f'<div class="signal {css}"><h1>{label}</h1><p>ציון: {s:.2f} · {note}</p></div>',unsafe_allow_html=True)
+if score>=5.0 and short_struct:
+    state,icon,css,idx,note="STRONG SHORT","🔴","strongshort",4,"Risk-Off מסונכרן. עדיין צריך טריגר מחיר."
+elif score>=2.5:
+    state,icon,css,idx,note="SHORT WATCH","🟠","shortwatch",3,"נטייה לשורט, אבל חסר סנכרון מלא."
+elif score<=-5.0 and long_struct:
+    state,icon,css,idx,note="STRONG LONG","🟢","stronglong",0,"Risk-On מסונכרן. עדיין צריך טריגר מחיר."
+elif score<=-2.5:
+    state,icon,css,idx,note="LONG WATCH","🔵","longwatch",1,"נטייה ללונג, אבל חסר סנכרון מלא."
+else:
+    state,icon,css,idx,note="WAIT","🟡","wait",2,"אין יתרון מספיק ברור."
 
-    st.subheader("מה המערכת רואה עכשיו")
-    st.write(f"**VIX9D / VIX:** {ratio9:.3f}")
-    st.write(f"**VIX / VIX3M:** {ratio3:.3f}")
-    st.write(f"**שינוי VIX ב־5 ימים:** {c5:+.2f}%")
-    st.write(f"**{market_name} מול EMA20:** {'מתחת' if M<me20 else 'מעל'}")
-    st.write(f"**מומנטום 2 ימים:** {m2:+.2f}%")
-    st.write(f"**מומנטום 5 ימים:** {m5:+.2f}%")
+states=["STRONG LONG","LONG WATCH","WAIT","SHORT WATCH","STRONG SHORT"]
+classes=["tag-green","tag-blue","tag-yellow","tag-orange","tag-red"]
+meter='<div class="meter">'
+for i,s in enumerate(states):
+    active=" active" if i==idx else ""
+    meter += f'<div class="{active}"><span class="tag {classes[i]}">{s}</span></div>'
+meter += '</div>'
 
-    with st.expander("פירוט הציון"):
-        for pts,txt in reasons: st.write(f"**{pts}** — {txt}")
+st.markdown(f'''
+<div class="signal {css}">
+  <div class="signal-title">{icon} {state}</div>
+  <div class="signal-sub">ציון: <b>{score:.2f}</b> · {note}</div>
+  {meter}
+</div>
+''', unsafe_allow_html=True)
 
-    st.subheader("פרוטוקול כניסה ל־2–3 ימים")
-    if "SHORT" in label:
-        st.markdown("""1. ה־VIX נותן **SHORT bias**, לא כניסה.
-2. ב־4H–1H חפש שבירת תמיכה / Lower High / כישלון פריצה.
-3. אשר ב־1H וב־15m שהנרות והמומנטום באותו כיוון.
-4. אם המדד חוזר מעל EMA20 וה־VIX מאבד EMA5 — הסט־אפ נחלש.
-5. בעסקה קצרה: נהל רווח בתוך 1–3 ימים; אל תהפוך אותה אוטומטית לעסקת טווח ארוך.""")
-    elif "LONG" in label:
-        st.markdown("""1. ה־VIX נותן **LONG bias**, לא כניסה.
-2. ב־4H–1H חפש שמירת תמיכה / Higher Low / פריצה איכותית.
-3. אשר ב־1H וב־15m שהנרות והמומנטום באותו כיוון.
-4. אם המדד נשבר מתחת EMA20 וה־VIX חוזר מעל EMA5 — הסט־אפ נחלש.
-5. בעסקה קצרה: נהל רווח בתוך 1–3 ימים; אל תהפוך אותה אוטומטית לעסקת טווח ארוך.""")
-    else:
-        st.info("WAIT: לא להכריח עסקה. חכה לסנכרון טוב יותר בין מבנה ה־VIX לבין המדד.")
+def metric_card(name, value, desc, btext, bcls):
+    st.markdown(f'''
+    <div class="metric-card">
+      <div class="metric-name">{name}</div>
+      <div class="metric-val">{value}</div>
+      {badge(btext,bcls)}
+      <div class="metric-desc" style="margin-top:8px">{desc}</div>
+    </div>
+    ''', unsafe_allow_html=True)
 
-    st.caption("המערכת היא מסנן הסתברותי/טכני ואינה מבטיחה תשואה או כיוון שוק.")
-except Exception as e:
-    st.error("לא הצלחתי למשוך את כל נתוני השוק כרגע. נסה רענון בעוד רגע.")
-    st.caption(str(e))
+c1,c2,c3=st.columns(3)
+with c1:
+    metric_card("VIX",f"{V:.2f}","מדד הפחד ל־30 יום. עלייה חדה = יותר לחץ בשוק.",f"{C1:+.2f}% היום","tag-red" if C1>0 else "tag-green")
+with c2:
+    metric_card("VIX9D",f"{V9:.2f}","ציפיות תנודתיות ל־9 ימים. חשוב במיוחד לעסקאות קצרות.","קצר־טווח","tag-blue")
+with c3:
+    metric_card("VIX3M",f"{V3:.2f}","ציפיות תנודתיות לכ־3 חודשים. משמש להשוואת מבנה הפחד.","טווח בינוני","tag-blue")
+
+c4,c5,c6=st.columns(3)
+with c4:
+    vv_state="גבוה" if not np.isnan(VV) and VV>=115 else "רגיל"
+    metric_card("VVIX",f"{VV:.1f}" if not np.isnan(VV) else "—","התנודתיות של ה־VIX עצמו. גבוה = שוק אופציות עצבני יותר.",vv_state,"tag-red" if vv_state=="גבוה" else "tag-green")
+with c5:
+    txt="לחץ קצר עולה" if R9>1.03 else ("רגוע" if R9<0.97 else "מאוזן")
+    cls="tag-red" if R9>1.03 else ("tag-green" if R9<0.97 else "tag-blue")
+    metric_card("VIX9D / VIX",f"{R9:.3f}","מעל 1 = פחד קצר־טווח חזק יותר. מתחת 1 = לחץ קצר מתון יותר.",txt,cls)
+with c6:
+    txt="לחץ חזק" if R3>=1.0 else ("רגיל" if R3<0.94 else "מתקרב ללחץ")
+    cls="tag-red" if R3>=1.0 else ("tag-green" if R3<0.94 else "tag-orange")
+    metric_card("VIX / VIX3M",f"{R3:.3f}","קרוב ל־1 ומעלה = עקום פחד מתוח. נמוך משמעותית מ־1 = Contango רגיל.",txt,cls)
+
+c7,c8,c9=st.columns(3)
+with c7:
+    metric_card("שינוי VIX (5 ימים)",f"{C5:+.2f}%","כמה הפחד השתנה בחמשת ימי המסחר האחרונים.","עולה" if C5>0 else "יורד","tag-red" if C5>0 else "tag-green")
+with c8:
+    metric_card(f"{market_name} / EMA20","מתחת" if M<ME20 else "מעל","מתחת EMA20 = חולשה קצרה. מעל EMA20 = מבנה חזק יותר.","חלש" if M<ME20 else "חזק","tag-red" if M<ME20 else "tag-green")
+with c9:
+    metric_card("מומנטום המדד",f"2D {M2:+.2f}% · 5D {M5:+.2f}%","בודק אם המדד באמת נע באותו כיוון שה־VIX מרמז.","שלילי" if M5<0 else "חיובי","tag-red" if M5<0 else "tag-green")
+
+st.markdown('<div class="panel"><h3>🎯 מה חסר כדי לעלות שלב?</h3>', unsafe_allow_html=True)
+
+if "SHORT" in state:
+    tasks=[
+        ("VIX9D/VIX ≥ 1.00",R9>=1.00,f"כרגע {R9:.3f}"),
+        ("VIX/VIX3M ≥ 0.98",R3>=0.98,f"כרגע {R3:.3f}"),
+        (f"{market_name} מתחת EMA20",M<ME20,"כן" if M<ME20 else "לא"),
+        ("מומנטום 2 ימים שלילי",M2<0,f"כרגע {M2:+.2f}%"),
+        ("VIX מעל EMA5",V>VE5,f"{V:.2f} מול {VE5:.2f}")
+    ]; goal="STRONG SHORT"
+elif "LONG" in state:
+    tasks=[
+        ("VIX9D/VIX ≤ 1.00",R9<=1.00,f"כרגע {R9:.3f}"),
+        ("VIX/VIX3M ≤ 0.96",R3<=0.96,f"כרגע {R3:.3f}"),
+        (f"{market_name} מעל EMA20",M>ME20,"כן" if M>ME20 else "לא"),
+        ("מומנטום 2 ימים חיובי",M2>0,f"כרגע {M2:+.2f}%"),
+        ("VIX מתחת EMA5",V<VE5,f"{V:.2f} מול {VE5:.2f}")
+    ]; goal="STRONG LONG"
+else:
+    tasks=[
+        ("כיוון VIX ברור",abs(C1)>=3,f"{C1:+.2f}%"),
+        ("מומנטום 2 ימים משמעותי",abs(M2)>=0.5,f"{M2:+.2f}%"),
+        ("מיקום מדד מול EMA20",True,"מעל" if M>ME20 else "מתחת")
+    ]; goal="WATCH"
+
+done=sum(1 for _,ok,_ in tasks if ok)
+for title,ok,current in tasks:
+    st.markdown(f'<div class="checkrow">{"✅" if ok else "➖"} <b>{title}</b> <span class="small-muted">— {current}</span></div>', unsafe_allow_html=True)
+
+st.markdown(f'<div class="scorebox" style="margin-top:12px"><div><b>התקדמות ל־{goal}</b><div class="small-muted">{done} מתוך {len(tasks)} תנאים</div></div><div class="scorepill">{done}/{len(tasks)}</div></div>', unsafe_allow_html=True)
+st.markdown('</div>', unsafe_allow_html=True)
+
+st.markdown('<div class="panel"><h3>💡 מה זה אומר בפועל?</h3>', unsafe_allow_html=True)
+if "SHORT" in state:
+    st.write("יש לחץ עולה בשוק. עכשיו לא נכנסים בגלל ה־VIX בלבד — מחפשים ב־4H/1H שבירת תמיכה, Lower High או כישלון פריצה.")
+    st.write("אישור סופי: 1H ו־15m צריכים לתמוך בירידה.")
+elif "LONG" in state:
+    st.write("הפחד נרגע והשוק מקבל סביבה תומכת יותר. מחפשים ב־4H/1H שמירת תמיכה, Higher Low או פריצה איכותית.")
+    st.write("אישור סופי: 1H ו־15m צריכים לתמוך בעלייה.")
+else:
+    st.write("אין כרגע יתרון ברור. המטרה היא לא להכריח עסקה — מחכים שה־VIX והמדד יסתנכרנו.")
+st.markdown('</div>', unsafe_allow_html=True)
+
+with st.expander("📊 פירוט הציון"):
+    for pts,txt in sorted(reasons,key=lambda x: abs(x[0]),reverse=True):
+        st.write(f"{'🔴' if pts>0 else ('🟢' if pts<0 else '⚪')} **{pts:+.2f}** — {txt}")
+
+st.caption(f"עודכן: {datetime.now().strftime('%H:%M')} · נתונים דרך Yahoo Finance / yfinance · כלי סינון מחקרי, לא ייעוץ השקעות.")
