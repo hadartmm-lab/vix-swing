@@ -10,13 +10,13 @@ st.set_page_config(page_title="VIX Swing Live", page_icon="🎮", layout="center
 st.markdown('''
 <style>
 :root{
-  --bg:#07131f; --card:#0b1f31; --line:#184869; --txt:#f3f7fb; --muted:#9eb2c4;
+  --bg:#07131f; --card:#0b1f31; --line:#184869; --txt:#f3f7fb; --muted:#d5e0ea;
 }
 html, body, [class*="css"] {background:var(--bg); color:var(--txt);}
 .stApp{background:linear-gradient(180deg,#07131f 0%,#081725 100%);}
 .block-container{max-width:840px;padding-top:1rem;padding-bottom:2rem;}
 h1,h2,h3{color:var(--txt)!important;}
-.small-muted{color:var(--muted);font-size:.88rem}
+.small-muted{color:#dce7f0;font-size:.9rem}
 .hero{background:linear-gradient(135deg,#0b1d2e,#102941);border:1px solid var(--line);border-radius:22px;padding:18px;margin-bottom:16px;box-shadow:0 10px 30px rgba(0,0,0,.25)}
 .signal{border-radius:22px;padding:22px 18px;text-align:center;border:1px solid rgba(255,255,255,.08);margin:12px 0 14px}
 .strongshort{background:linear-gradient(135deg,#4a1218,#2a1115)}
@@ -30,9 +30,9 @@ h1,h2,h3{color:var(--txt)!important;}
 .meter > div{padding:8px 4px;border-radius:12px;text-align:center;font-size:.72rem;border:1px solid rgba(255,255,255,.06);opacity:.6;background:#0a1a28}
 .active{opacity:1!important;box-shadow:0 0 18px rgba(255,255,255,.12)}
 .metric-card{background:linear-gradient(180deg,#0b1f31,#0a1a28);border:1px solid var(--line);border-radius:18px;padding:14px;min-height:142px;margin-bottom:10px}
-.metric-name{color:#dbe7f1;font-weight:800;font-size:.95rem}
-.metric-val{font-size:1.85rem;font-weight:900;margin:6px 0}
-.metric-desc{color:var(--muted);font-size:.82rem;line-height:1.35}
+.metric-name{color:#ffffff;font-weight:800;font-size:.95rem}
+.metric-val{font-size:1.85rem;font-weight:900;margin:6px 0;color:#ffffff}
+.metric-desc{color:#dce7f0;font-size:.84rem;line-height:1.4}
 .tag{display:inline-block;padding:4px 9px;border-radius:999px;font-size:.75rem;font-weight:800;margin-top:6px}
 .tag-green{background:#103d2a;color:#6ff0aa}.tag-blue{background:#10344d;color:#74caff}.tag-yellow{background:#4b4015;color:#ffe077}.tag-orange{background:#4b2d11;color:#ffb66b}.tag-red{background:#4a171b;color:#ff858b}
 .panel{background:linear-gradient(180deg,#0b1f31,#0a1a28);border:1px solid var(--line);border-radius:18px;padding:16px;margin:12px 0}
@@ -40,6 +40,18 @@ h1,h2,h3{color:var(--txt)!important;}
 .scorebox{display:flex;justify-content:space-between;gap:12px;align-items:center;background:#091827;border:1px solid var(--line);border-radius:16px;padding:14px}
 .scorepill{min-width:90px;text-align:center;padding:10px;border-radius:14px;background:#0f2740;font-size:1.25rem;font-weight:900}
 .stButton>button{width:100%;border-radius:14px;border:1px solid #1f6fa0;background:#0c2d46;color:white;font-weight:800;padding:.7rem 1rem}
+[data-testid="stMarkdownContainer"] p,
+[data-testid="stMarkdownContainer"] li,
+[data-testid="stMarkdownContainer"] span,
+[data-testid="stRadio"] label,
+[data-testid="stWidgetLabel"] p,
+.stRadio label,
+.stRadio p {color:#f3f7fb !important;}
+[data-testid="stCaptionContainer"] p {color:#c9d7e3 !important;}
+.checkrow, .scorebox, .panel {color:#f3f7fb !important;}
+.hero {color:#ffffff !important;}
+.signal-title, .signal-sub {color:#ffffff !important;}
+
 </style>
 ''', unsafe_allow_html=True)
 
