@@ -1,284 +1,170 @@
-
-import math
-from datetime import datetime, timezone
-
-import numpy as np
-import pandas as pd
 import streamlit as st
+import pandas as pd
+import numpy as np
 import yfinance as yf
 
-st.set_page_config(page_title="VIX Swing Live", page_icon="📈", layout="centered")
-
-# ---------- UI ----------
+st.set_page_config(page_title="VIX Swing Live", page_icon="📊", layout="centered")
 st.markdown("""
 <style>
-.block-container {padding-top: 1.2rem; padding-bottom: 2rem; max-width: 760px;}
-h1 {font-size: 2.4rem !important; line-height: 1.05;}
-.signal {
-    padding: 18px; border-radius: 18px; text-align: center;
-    margin: 14px 0 10px 0; border: 1px solid rgba(120,120,120,.25);
-}
-.signal-long {background: rgba(31, 180, 95, .12);}
-.signal-short {background: rgba(230, 70, 70, .12);}
-.signal-wait {background: rgba(235, 180, 25, .12);}
-.big {font-size: 2.25rem; font-weight: 850; margin: 0;}
-.small {opacity: .72; font-size: .92rem;}
-.rule {padding: 10px 0; border-top: 1px solid rgba(120,120,120,.18);}
-</style>
-""", unsafe_allow_html=True)
+.block-container{max-width:820px;padding-top:2rem}
+.signal{padding:22px;border-radius:18px;text-align:center;margin:18px 0}
+.strongshort{background:#ffdede}.shortwatch{background:#fff0df}
+.wait{background:#fff7cf}.longwatch{background:#e6f5ff}.stronglong{background:#dcf7e7}
+.signal h1{margin:0;font-size:42px}.signal p{margin:8px 0 0}
+</style>""", unsafe_allow_html=True)
+
+@st.cache_data(ttl=300)
+def hist(ticker, period="6mo"):
+    x = yf.download(ticker, period=period, interval="1d", auto_adjust=False,
+                    progress=False, threads=False)
+    if isinstance(x.columns, pd.MultiIndex):
+        x.columns = x.columns.get_level_values(0)
+    return x.dropna()
+
+def close_series(df):
+    c = df["Close"]
+    if isinstance(c, pd.DataFrame): c = c.iloc[:,0]
+    return c.astype(float).dropna()
+
+def rsi(s, n=14):
+    d=s.diff(); up=d.clip(lower=0).ewm(alpha=1/n,adjust=False).mean()
+    dn=(-d.clip(upper=0)).ewm(alpha=1/n,adjust=False).mean()
+    return 100-(100/(1+up/dn.replace(0,np.nan)))
+
+def get_one(candidates):
+    for t in candidates:
+        try:
+            d=hist(t)
+            if len(d)>25: return t, close_series(d)
+        except: pass
+    return None, None
 
 st.title("VIX Swing Live")
-st.caption("מסנן סביבת שוק לעסקאות קצרות של 2–3 ימי מסחר. ה‑VIX הוא מסנן כיוון וסיכון — לא טריגר כניסה עצמאי.")
-
-# ---------- Helpers ----------
-def rsi(series: pd.Series, period: int = 14) -> float:
-    s = series.dropna()
-    if len(s) < period + 2:
-        return np.nan
-    d = s.diff()
-    up = d.clip(lower=0)
-    down = -d.clip(upper=0)
-    avg_up = up.ewm(alpha=1/period, adjust=False).mean()
-    avg_down = down.ewm(alpha=1/period, adjust=False).mean()
-    rs = avg_up / avg_down.replace(0, np.nan)
-    value = 100 - (100 / (1 + rs))
-    return float(value.iloc[-1])
-
-def pct_change_n(s: pd.Series, n: int) -> float:
-    s = s.dropna()
-    if len(s) <= n:
-        return np.nan
-    return float((s.iloc[-1] / s.iloc[-1-n] - 1) * 100)
-
-def latest(s: pd.Series) -> float:
-    s = s.dropna()
-    return float(s.iloc[-1])
-
-def ema(s: pd.Series, n: int) -> float:
-    return float(s.dropna().ewm(span=n, adjust=False).mean().iloc[-1])
-
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_data():
-    tickers = {
-        "VIX": "^VIX",
-        "VIX9D": "^VIX9D",
-        "VIX3M": "^VIX3M",
-        "VVIX": "^VVIX",
-        "NASDAQ": "^NDX",
-        "SP500": "^GSPC",
-    }
-    out = {}
-    for k, t in tickers.items():
-        df = yf.download(t, period="6mo", interval="1d", progress=False, auto_adjust=False, threads=False)
-        if df is None or df.empty:
-            out[k] = None
-            continue
-        # yfinance may return MultiIndex columns
-        if isinstance(df.columns, pd.MultiIndex):
-            close = df["Close"][t] if t in df["Close"].columns else df["Close"].iloc[:, 0]
-        else:
-            close = df["Close"]
-        out[k] = close.dropna()
-    return out
+st.caption("מסנן סביבת שוק לעסקאות קצרות של 2–3 ימי מסחר. VIX הוא מסנן — לא טריגר כניסה עצמאי.")
 
 if st.button("🔄 רענן נתונים", use_container_width=True):
-    st.cache_data.clear()
+    st.cache_data.clear(); st.rerun()
 
-with st.spinner("מושך נתוני שוק..."):
-    data = fetch_data()
+market_name=st.radio("מדד לניתוח",["Nasdaq 100","S&P 500"],horizontal=True)
+market_ticker="^NDX" if market_name=="Nasdaq 100" else "^GSPC"
 
-required = ["VIX", "VIX9D", "VIX3M", "NASDAQ", "SP500"]
-missing = [k for k in required if data.get(k) is None or len(data[k]) < 25]
-if missing:
-    st.error("לא הצלחתי לקבל כרגע את כל הנתונים הדרושים: " + ", ".join(missing))
-    st.stop()
+try:
+    _,v=get_one(["^VIX"]); _,v9=get_one(["^VIX9D"])
+    _,v3=get_one(["^VIX3M"]); _,vv=get_one(["^VVIX"])
+    _,m=get_one([market_ticker])
+    if any(x is None for x in [v,v9,v3,m]): raise ValueError("missing market series")
 
-market_choice = st.radio("מדד לניתוח", ["Nasdaq 100", "S&P 500"], horizontal=True)
-mkt_key = "NASDAQ" if market_choice == "Nasdaq 100" else "SP500"
+    V=float(v.iloc[-1]); V9=float(v9.iloc[-1]); V3=float(v3.iloc[-1])
+    VV=float(vv.iloc[-1]) if vv is not None else np.nan
+    e5=float(v.ewm(span=5,adjust=False).mean().iloc[-1])
+    e10=float(v.ewm(span=10,adjust=False).mean().iloc[-1])
+    vrsi=float(rsi(v).iloc[-1])
+    c1=(V/float(v.iloc[-2])-1)*100
+    c5=(V/float(v.iloc[-6])-1)*100
+    me20=float(m.ewm(span=20,adjust=False).mean().iloc[-1])
+    M=float(m.iloc[-1]); m2=(M/float(m.iloc[-3])-1)*100; m5=(M/float(m.iloc[-6])-1)*100
+    ratio9=V9/V; ratio3=V/V3
 
-vix_s = data["VIX"]
-v9_s = data["VIX9D"]
-v3m_s = data["VIX3M"]
-vvix_s = data.get("VVIX")
-mkt_s = data[mkt_key]
+    a,b,c=st.columns(3)
+    a.metric("VIX",f"{V:.2f}",f"{c1:+.2f}%")
+    b.metric("VIX9D",f"{V9:.2f}")
+    c.metric("VIX3M",f"{V3:.2f}")
+    st.caption(f"VVIX: {VV:.1f} · VIX EMA5: {e5:.2f} · EMA10: {e10:.2f} · RSI: {vrsi:.0f}")
 
-vix = latest(vix_s)
-v9 = latest(v9_s)
-v3m = latest(v3m_s)
-vvix = latest(vvix_s) if vvix_s is not None and len(vvix_s) else np.nan
+    # Positive = risk-off / favors equity short.
+    s=0.0; reasons=[]
+    def add(points,text):
+        nonlocal_dummy = None
+        return points,text
 
-vix_ema5 = ema(vix_s, 5)
-vix_ema10 = ema(vix_s, 10)
-vix_1d = pct_change_n(vix_s, 1)
-vix_5d = pct_change_n(vix_s, 5)
-vix_rsi = rsi(vix_s, 14)
+    if V>e5: s+=1.2; reasons.append(("+1.20","VIX מעל EMA5"))
+    else: s-=1.2; reasons.append(("-1.20","VIX מתחת EMA5"))
+    if e5>e10: s+=1.0; reasons.append(("+1.00","EMA5 מעל EMA10"))
+    else: s-=1.0; reasons.append(("-1.00","EMA5 מתחת EMA10"))
 
-mkt = latest(mkt_s)
-mkt_ema5 = ema(mkt_s, 5)
-mkt_ema20 = ema(mkt_s, 20)
-mkt_2d = pct_change_n(mkt_s, 2)
-mkt_5d = pct_change_n(mkt_s, 5)
+    if ratio9>=1.03: s+=1.4; reasons.append(("+1.40","VIX9D בפרמיה מעל VIX"))
+    elif ratio9<=0.97: s-=1.0; reasons.append(("-1.00","VIX9D מתחת VIX"))
+    else: reasons.append(("0.00","VIX9D/VIX ניטרלי"))
 
-# Ratios: short fear vs broad 30d, and 30d vs 3m term slope
-short_ratio = v9 / vix if vix else np.nan
-term_ratio = vix / v3m if v3m else np.nan
+    if c1>=8: s+=1.4; reasons.append(("+1.40","זינוק VIX יומי ≥8%"))
+    elif c1>=3: s+=0.7; reasons.append(("+0.70","VIX עולה ≥3% ביום"))
+    elif c1<=-8: s-=1.4; reasons.append(("-1.40","VIX יורד ≥8% ביום"))
+    elif c1<=-3: s-=0.7; reasons.append(("-0.70","VIX יורד ≥3% ביום"))
 
-# ---------- Scoring ----------
-# Positive = risk-off / favors looking for SHORT
-# Negative = risk-on / favors looking for LONG
-score = 0.0
-reasons = []
+    if c5>=10: s+=1.2; reasons.append(("+1.20","VIX עלה ≥10% ב־5 ימים"))
+    elif c5>=4: s+=0.7; reasons.append(("+0.70","VIX עלה ≥4% ב־5 ימים"))
+    elif c5<=-10: s-=1.2; reasons.append(("-1.20","VIX ירד ≥10% ב־5 ימים"))
+    elif c5<=-4: s-=0.7; reasons.append(("-0.70","VIX ירד ≥4% ב־5 ימים"))
 
-def add(points, text):
-    global score
-    score += points
-    reasons.append((points, text))
+    # Term structure: stronger confirmation only when the front end actually inverts.
+    if ratio3>=1.02: s+=1.35; reasons.append(("+1.35","VIX מעל VIX3M — לחץ/Backwardation"))
+    elif ratio3<=0.94: s-=0.45; reasons.append(("-0.45","Contango ברור — מוריד עוצמת SHORT"))
 
-# 1) VIX short trend
-if vix > vix_ema5:
-    add(+0.9, "VIX מעל EMA5")
-else:
-    add(-0.9, "VIX מתחת EMA5")
+    if M<me20: s+=1.0; reasons.append(("+1.00",f"{market_name} מתחת EMA20"))
+    else: s-=1.0; reasons.append(("-1.00",f"{market_name} מעל EMA20"))
+    if m2<=-0.5: s+=1.0; reasons.append(("+1.00","מומנטום 2 ימים שלילי"))
+    elif m2>=0.5: s-=1.0; reasons.append(("-1.00","מומנטום 2 ימים חיובי"))
+    if m5<=-1.0: s+=0.6; reasons.append(("+0.60","מומנטום 5 ימים שלילי"))
+    elif m5>=1.0: s-=0.6; reasons.append(("-0.60","מומנטום 5 ימים חיובי"))
 
-if vix_ema5 > vix_ema10:
-    add(+0.8, "EMA5 של VIX מעל EMA10")
-else:
-    add(-0.8, "EMA5 של VIX מתחת EMA10")
+    if vrsi>=60: s+=0.35; reasons.append(("+0.35","RSI VIX תומך בעלייה"))
+    elif vrsi<=40: s-=0.35; reasons.append(("-0.35","RSI VIX תומך בירידה"))
 
-# 2) Very-short fear curve: VIX9D relative to VIX
-if short_ratio >= 1.04:
-    add(+1.25, "VIX9D גבוה משמעותית מ‑VIX — לחץ קצר־טווח")
-elif short_ratio <= 0.96:
-    add(-0.85, "VIX9D נמוך משמעותית מ‑VIX — לחץ קצר נרגע")
+    # VVIX is confirmation, not a standalone trigger.
+    if not np.isnan(VV):
+        if VV>=115: s+=0.55; reasons.append(("+0.55","VVIX גבוה — אי־ודאות גבוהה"))
+        elif VV<85: s-=0.25; reasons.append(("-0.25","VVIX נמוך"))
 
-# 3) Term structure proxy: VIX vs VIX3M
-if term_ratio >= 1.00:
-    add(+1.20, "VIX ≥ VIX3M — עקום הפוך/לחוץ")
-elif term_ratio <= 0.90:
-    add(-0.75, "VIX נמוך משמעותית מ‑VIX3M — עקום רגוע")
-else:
-    add(-0.15, "עקום VIX רגיל אך לא עמוק")
+    # Five-state mapping. Strong states require both score AND structural confirmation.
+    short_struct = (ratio9>=1.0 and ratio3>=0.98 and V>e5 and M<me20)
+    long_struct  = (ratio9<=1.0 and ratio3<=0.96 and V<e5 and M>me20)
 
-# 4) VIX impulse
-if vix_1d >= 8:
-    add(+1.0, "קפיצת VIX יומית חדה")
-elif vix_1d >= 3:
-    add(+0.5, "VIX עולה היום")
-elif vix_1d <= -8:
-    add(-1.0, "נפילת VIX יומית חדה")
-elif vix_1d <= -3:
-    add(-0.5, "VIX יורד היום")
+    if s>=5.0 and short_struct:
+        label="🔴 STRONG SHORT"; css="strongshort"
+        note="סביבת Risk-Off מסונכרנת. עדיין נכנסים רק אחרי טריגר מחיר."
+    elif s>=2.5:
+        label="🟠 SHORT WATCH"; css="shortwatch"
+        note="יש נטייה לשורט, אבל חסר סנכרון מלא. חפש אישור — לא כניסה אוטומטית."
+    elif s<=-5.0 and long_struct:
+        label="🟢 STRONG LONG"; css="stronglong"
+        note="סביבת Risk-On מסונכרנת. עדיין נכנסים רק אחרי טריגר מחיר."
+    elif s<=-2.5:
+        label="🔵 LONG WATCH"; css="longwatch"
+        note="יש נטייה ללונג, אבל חסר סנכרון מלא. חפש אישור — לא כניסה אוטומטית."
+    else:
+        label="🟡 WAIT"; css="wait"
+        note="אין כרגע יתרון מספיק ברור לעסקה קצרה."
 
-if vix_5d >= 10:
-    add(+0.8, "VIX עלה חזק ב‑5 ימים")
-elif vix_5d <= -10:
-    add(-0.8, "VIX ירד חזק ב‑5 ימים")
+    st.markdown(f'<div class="signal {css}"><h1>{label}</h1><p>ציון: {s:.2f} · {note}</p></div>',unsafe_allow_html=True)
 
-# 5) Market confirmation — important for 2–3 day trades
-if mkt > mkt_ema20:
-    add(-0.85, f"{market_choice} מעל EMA20")
-else:
-    add(+0.85, f"{market_choice} מתחת EMA20")
+    st.subheader("מה המערכת רואה עכשיו")
+    st.write(f"**VIX9D / VIX:** {ratio9:.3f}")
+    st.write(f"**VIX / VIX3M:** {ratio3:.3f}")
+    st.write(f"**שינוי VIX ב־5 ימים:** {c5:+.2f}%")
+    st.write(f"**{market_name} מול EMA20:** {'מתחת' if M<me20 else 'מעל'}")
+    st.write(f"**מומנטום 2 ימים:** {m2:+.2f}%")
+    st.write(f"**מומנטום 5 ימים:** {m5:+.2f}%")
 
-if mkt > mkt_ema5:
-    add(-0.55, f"{market_choice} מעל EMA5")
-else:
-    add(+0.55, f"{market_choice} מתחת EMA5")
+    with st.expander("פירוט הציון"):
+        for pts,txt in reasons: st.write(f"**{pts}** — {txt}")
 
-if mkt_2d >= 1.0:
-    add(-0.6, f"{market_choice} במומנטום חיובי ל‑2 ימים")
-elif mkt_2d <= -1.0:
-    add(+0.6, f"{market_choice} במומנטום שלילי ל‑2 ימים")
+    st.subheader("פרוטוקול כניסה ל־2–3 ימים")
+    if "SHORT" in label:
+        st.markdown("""1. ה־VIX נותן **SHORT bias**, לא כניסה.
+2. ב־4H–1H חפש שבירת תמיכה / Lower High / כישלון פריצה.
+3. אשר ב־1H וב־15m שהנרות והמומנטום באותו כיוון.
+4. אם המדד חוזר מעל EMA20 וה־VIX מאבד EMA5 — הסט־אפ נחלש.
+5. בעסקה קצרה: נהל רווח בתוך 1–3 ימים; אל תהפוך אותה אוטומטית לעסקת טווח ארוך.""")
+    elif "LONG" in label:
+        st.markdown("""1. ה־VIX נותן **LONG bias**, לא כניסה.
+2. ב־4H–1H חפש שמירת תמיכה / Higher Low / פריצה איכותית.
+3. אשר ב־1H וב־15m שהנרות והמומנטום באותו כיוון.
+4. אם המדד נשבר מתחת EMA20 וה־VIX חוזר מעל EMA5 — הסט־אפ נחלש.
+5. בעסקה קצרה: נהל רווח בתוך 1–3 ימים; אל תהפוך אותה אוטומטית לעסקת טווח ארוך.""")
+    else:
+        st.info("WAIT: לא להכריח עסקה. חכה לסנכרון טוב יותר בין מבנה ה־VIX לבין המדד.")
 
-# 6) VVIX = volatility of VIX; use modestly
-if not np.isnan(vvix):
-    if vvix >= 115:
-        add(+0.45, "VVIX גבוה — אי־ודאות בשוק האופציות")
-    elif vvix <= 90:
-        add(-0.25, "VVIX רגוע")
-
-# 7) RSI only as momentum confirmation, never as automatic reversal
-if not np.isnan(vix_rsi):
-    if vix_rsi >= 60:
-        add(+0.25, "RSI VIX תומך במומנטום עולה")
-    elif vix_rsi <= 40:
-        add(-0.25, "RSI VIX תומך במומנטום יורד")
-
-# ---------- Decision ----------
-# Slightly stricter threshold to avoid overtrading
-if score >= 3.2:
-    signal = "🔴 חיפוש SHORT"
-    css = "signal-short"
-    regime = "RISK-OFF"
-    action = "לחפש טריגר שורט במדד/מניה ב־1H–4H. לא לרדוף אחרי ירידה שכבר התרחשה."
-elif score <= -3.2:
-    signal = "🟢 חיפוש LONG"
-    css = "signal-long"
-    regime = "RISK-ON"
-    action = "לחפש טריגר לונג במדד/מניה ב־1H–4H, עדיפות לנכס שמראה חוזק יחסי."
-else:
-    signal = "🟡 המתנה"
-    css = "signal-wait"
-    regime = "NEUTRAL"
-    action = "אין מספיק סנכרון לעסקה קצרה. עדיף להמתין מאשר להכריח עסקה."
-
-abs_s = abs(score)
-quality = (
-    "חזק מאוד" if abs_s >= 5.0 else
-    "חזק" if abs_s >= 4.2 else
-    "בינוני־חזק" if abs_s >= 3.2 else
-    "בינוני" if abs_s >= 2.0 else
-    "חלש"
-)
-
-# ---------- Display ----------
-c1, c2, c3 = st.columns(3)
-c1.metric("VIX", f"{vix:.2f}", f"{vix_1d:+.2f}%")
-c2.metric("VIX9D", f"{v9:.2f}")
-c3.metric("VIX3M", f"{v3m:.2f}")
-
-if not np.isnan(vvix):
-    st.caption(f"VVIX: {vvix:.1f} · VIX EMA5: {vix_ema5:.2f} · EMA10: {vix_ema10:.2f} · RSI: {vix_rsi:.0f}")
-
-st.markdown(
-    f'<div class="signal {css}"><div class="big">{signal}</div>'
-    f'<div>{regime} · ציון {score:.2f} · איכות: <b>{quality}</b></div></div>',
-    unsafe_allow_html=True
-)
-
-st.info(action)
-
-st.subheader("מה המערכת רואה עכשיו")
-col1, col2 = st.columns(2)
-with col1:
-    st.write(f"**VIX9D / VIX:** {short_ratio:.3f}")
-    st.write(f"**VIX / VIX3M:** {term_ratio:.3f}")
-    st.write(f"**VIX שינוי 5 ימים:** {vix_5d:+.2f}%")
-with col2:
-    st.write(f"**{market_choice} מול EMA20:** {'מעל' if mkt > mkt_ema20 else 'מתחת'}")
-    st.write(f"**מומנטום 2 ימים:** {mkt_2d:+.2f}%")
-    st.write(f"**מומנטום 5 ימים:** {mkt_5d:+.2f}%")
-
-with st.expander("פירוט הציון"):
-    for pts, text in sorted(reasons, key=lambda x: abs(x[0]), reverse=True):
-        icon = "🔴" if pts > 0 else "🟢"
-        st.markdown(f'<div class="rule">{icon} <b>{pts:+.2f}</b> — {text}</div>', unsafe_allow_html=True)
-
-st.subheader("פרוטוקול כניסה ל־2–3 ימים")
-if signal.startswith("🟢"):
-    st.write("1. האפליקציה נותנת **LONG bias**.")
-    st.write("2. מחפשים ב־1H–4H: higher low / פריצה / החזקת תמיכה.")
-    st.write("3. כניסה רק אם גם 1H ו־15m מתחילים לנוע באותו כיוון.")
-    st.write("4. אם VIX חוזר מעל EMA5/EMA10 והמדד נשבר מתחת EMA20 — מבטלים/מקטינים.")
-    st.write("5. לקחת רווח חלקי מוקדם; העסקה מיועדת ל־1–3 ימי מסחר, לא להחזקה ארוכה.")
-elif signal.startswith("🔴"):
-    st.write("1. האפליקציה נותנת **SHORT bias**.")
-    st.write("2. מחפשים ב־1H–4H: lower high / שבירת תמיכה / כישלון פריצה.")
-    st.write("3. כניסה רק אם גם 1H ו־15m תומכים בירידה.")
-    st.write("4. אם VIX יורד חזרה מתחת EMA5 והמדד חוזר מעל EMA20 — מבטלים/מקטינים.")
-    st.write("5. לא לרדוף אחרי נר ירידה גדול; לקחת רווח חלקי בתוך 1–2 ימים.")
-else:
-    st.write("אין עסקה רק בגלל ה‑VIX. ממתינים עד שהפחד והמדד מסתנכרנים.")
-
-st.caption("הנתונים מתקבלים מ‑Yahoo Finance דרך yfinance ומתעדכנים לפי זמינות המקור. זהו כלי סינון מחקרי, לא ייעוץ השקעות ולא הבטחת תשואה.")
-st.caption("רענון אוטומטי של המטמון: עד 5 דקות. אפשר ללחוץ על 'רענן נתונים' בכל עת.")
+    st.caption("המערכת היא מסנן הסתברותי/טכני ואינה מבטיחה תשואה או כיוון שוק.")
+except Exception as e:
+    st.error("לא הצלחתי למשוך את כל נתוני השוק כרגע. נסה רענון בעוד רגע.")
+    st.caption(str(e))
