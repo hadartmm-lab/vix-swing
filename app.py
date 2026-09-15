@@ -28,9 +28,10 @@ html,body,[class*="css"]{background:var(--bg);color:var(--txt)}
 .status{background:#0a1a28;border:1px solid #214d6b;border-radius:15px;padding:11px 13px;display:flex;justify-content:space-between;align-items:center;gap:12px}
 .status-name{font-weight:850;font-size:.92rem;color:#eef5fa}.status-val{font-weight:900;text-align:left;white-space:nowrap}
 .green{color:#72e8a7}.red{color:#ff8c92}.orange{color:#ffc06d}.blue{color:#82c9ff}.yellow{color:#ffe47b}.white{color:#fff}
-.panel{background:#0b1f31;border:1px solid var(--line);border-radius:18px;padding:14px;margin-top:11px}
+.panel{background:#0b1f31;border:1px solid var(--line);border-radius:18px;padding:14px;margin-top:11px;color:#ffffff}
+.panel, .panel *{color:#ffffff!important}
 .stButton>button{width:100%;border-radius:14px;border:1px solid #1f6fa0;background:#0c2d46;color:white;font-weight:850;padding:.65rem 1rem}
-[data-testid="stMarkdownContainer"] p,[data-testid="stMarkdownContainer"] li,[data-testid="stRadio"] label,[data-testid="stWidgetLabel"] p{color:#f3f7fb!important}
+[data-testid="stMarkdownContainer"] p,[data-testid="stMarkdownContainer"] li,[data-testid="stRadio"] label,[data-testid="stWidgetLabel"] p,[data-testid="stCaptionContainer"] p,[data-testid="stExpander"] summary,[data-testid="stExpander"] summary p{color:#f3f7fb!important}
 </style>
 ''', unsafe_allow_html=True)
 
@@ -47,8 +48,8 @@ def fetch_close(ticker, period="6mo", interval="1d"):
     return c.astype(float).dropna()
 
 @st.cache_data(ttl=300, show_spinner=False)
-def fetch_ohlc(ticker, period="3mo"):
-    df = yf.download(ticker, period=period, interval="1d", auto_adjust=False, progress=False, threads=False)
+def fetch_ohlc(ticker, period="3mo", interval="1d"):
+    df = yf.download(ticker, period=period, interval=interval, auto_adjust=False, progress=False, threads=False)
     if df is None or df.empty: return None
     if isinstance(df.columns, pd.MultiIndex):
         out = pd.DataFrame(index=df.index)
@@ -73,20 +74,66 @@ def resample_close(s,hours):
     try: return s.resample(f"{hours}h").last().dropna()
     except Exception: return None
 
-def detect_divergence(s,lookback=45,pivot=2):
-    if s is None or len(s)<25: return "none"
-    x=s.dropna().iloc[-lookback:]; r=rsi_series(x,14)
-    lows=[]; highs=[]
-    for i in range(pivot,len(x)-pivot):
-        w=x.iloc[i-pivot:i+pivot+1]
-        if x.iloc[i]==w.min(): lows.append(i)
-        if x.iloc[i]==w.max(): highs.append(i)
-    if len(lows)>=2:
-        a,b=lows[-2],lows[-1]
-        if pd.notna(r.iloc[a]) and pd.notna(r.iloc[b]) and x.iloc[b]<x.iloc[a] and r.iloc[b]>r.iloc[a]: return "bullish"
-    if len(highs)>=2:
-        a,b=highs[-2],highs[-1]
-        if pd.notna(r.iloc[a]) and pd.notna(r.iloc[b]) and x.iloc[b]>x.iloc[a] and r.iloc[b]<r.iloc[a]: return "bearish"
+
+
+def resample_ohlc(df,hours):
+    if df is None or len(df)<20 or not isinstance(df.index,pd.DatetimeIndex): return None
+    try:
+        out=df.resample(f"{hours}h").agg({"Open":"first","High":"max","Low":"min","Close":"last"}).dropna()
+        return out
+    except Exception:
+        return None
+
+def detect_divergence(s, lookback=45, pivot=2, min_sep=3, min_price_pct=0.7, min_rsi_delta=4.0, recent_bars=8):
+    """Strict RSI divergence detector for VIX.
+
+    A signal is accepted only when the two swing points are clearly separated,
+    the price makes a meaningful new high/low, RSI moves materially the opposite
+    way, and the most recent pivot is still recent. This filters weak/ambiguous
+    divergences that can appear from small local wiggles.
+    """
+    if s is None or len(s) < 30:
+        return "none"
+
+    x = s.dropna().iloc[-lookback:]
+    if len(x) < 30:
+        return "none"
+    r = rsi_series(x, 14)
+
+    lows, highs = [], []
+    for i in range(pivot, len(x) - pivot):
+        w = x.iloc[i-pivot:i+pivot+1]
+        # Require a unique local extreme where possible; this avoids flat/noisy pivots.
+        if x.iloc[i] == w.min() and (w == x.iloc[i]).sum() == 1:
+            lows.append(i)
+        if x.iloc[i] == w.max() and (w == x.iloc[i]).sum() == 1:
+            highs.append(i)
+
+    def valid_pair(a, b):
+        if b - a < min_sep:
+            return False
+        if len(x) - 1 - b > recent_bars:
+            return False
+        return pd.notna(r.iloc[a]) and pd.notna(r.iloc[b])
+
+    # Bullish divergence on VIX: lower VIX low + higher RSI low -> supports VIX rebound / QQQ short.
+    if len(lows) >= 2:
+        a, b = lows[-2], lows[-1]
+        if valid_pair(a, b):
+            price_change = (x.iloc[b] / x.iloc[a] - 1) * 100
+            rsi_change = float(r.iloc[b] - r.iloc[a])
+            if price_change <= -min_price_pct and rsi_change >= min_rsi_delta:
+                return "bullish"
+
+    # Bearish divergence on VIX: higher VIX high + lower RSI high -> supports VIX fade / QQQ long.
+    if len(highs) >= 2:
+        a, b = highs[-2], highs[-1]
+        if valid_pair(a, b):
+            price_change = (x.iloc[b] / x.iloc[a] - 1) * 100
+            rsi_change = float(r.iloc[b] - r.iloc[a])
+            if price_change >= min_price_pct and rsi_change <= -min_rsi_delta:
+                return "bearish"
+
     return "none"
 
 def cross_status(s):
@@ -145,18 +192,25 @@ with st.spinner("מחשב..."):
     v3=fetch_close("^VIX3M",period="6mo")
     vv=fetch_close("^VVIX",period="6mo")
     m=fetch_close(market_ticker,period="6mo")
-    mo=fetch_ohlc(market_ticker,period="3mo")
+    m_intra=fetch_close(market_ticker,period="60d",interval="60m")
+    mo_intra=fetch_ohlc(market_ticker,period="60d",interval="60m")
 
 if any(x is None or len(x)<30 for x in [v,v9,v3,m]):
     st.error("לא הצלחתי למשוך כרגע את כל הנתונים. נסה רענון."); st.stop()
 
 V=float(v.iloc[-1]); V9=float(v9.iloc[-1]); V3=float(v3.iloc[-1]); VV=float(vv.iloc[-1]) if vv is not None and len(vv) else np.nan
-VE9,VE26,CROSS,CROSS_AGE,APPROACH,CROSS_NEAR,GAP=cross_status(v)
+V12=resample_close(v_intra,12)
+M12=resample_close(m_intra,12)
+MO12=resample_ohlc(mo_intra,12)
+if V12 is None or len(V12)<30 or M12 is None or len(M12)<20 or MO12 is None or len(MO12)<20:
+    st.error("לא הצלחתי לבנות כרגע נתוני 12H. נסה רענון."); st.stop()
+V12_LAST=float(V12.iloc[-1])
+VE9,VE26,CROSS,CROSS_AGE,APPROACH,CROSS_NEAR,GAP=cross_status(V12)
 C1=pctn(v,1); C5=pctn(v,5); R9=V9/V; R3=V/V3
-M=float(m.iloc[-1]); ME26=float(ema_series(m,26).iloc[-1]); M2=pctn(m,2); M5=pctn(m,5)
-DIV4=detect_divergence(resample_close(v_intra,4),55,2)
-DIV12=detect_divergence(resample_close(v_intra,12),45,2)
-SR, SUPPORT, RESISTANCE=support_resistance_signal(mo,22,2)
+M=float(m.iloc[-1]); M2=pctn(m,2); M5=pctn(m,5)
+DIV4=detect_divergence(resample_close(v_intra,4), lookback=60, pivot=3, min_sep=4, min_price_pct=0.75, min_rsi_delta=4.0, recent_bars=8)
+DIV12=detect_divergence(V12, lookback=50, pivot=2, min_sep=3, min_price_pct=1.0, min_rsi_delta=4.0, recent_bars=6)
+SR, SUPPORT, RESISTANCE=support_resistance_signal(MO12,44,2)
 
 score=0.0; reasons=[]
 def add(p,t):
@@ -164,7 +218,7 @@ def add(p,t):
     score+=p; reasons.append((p,t))
 
 # VIX EMA structure
-add(1.2 if V>VE9 else -1.2, "VIX מעל EMA9" if V>VE9 else "VIX מתחת EMA9")
+add(1.2 if V12_LAST>VE9 else -1.2, "VIX 12H מעל EMA9" if V12_LAST>VE9 else "VIX 12H מתחת EMA9")
 add(1.0 if VE9>VE26 else -1.0, "EMA9 מעל EMA26" if VE9>VE26 else "EMA9 מתחת EMA26")
 if CROSS=="golden" and CROSS_AGE is not None and CROSS_AGE<=5: add(0.6,"Golden Cross טרי ב-VIX")
 elif CROSS=="death" and CROSS_AGE is not None and CROSS_AGE<=5: add(-0.6,"Death Cross טרי ב-VIX")
@@ -185,8 +239,7 @@ elif C5<=-4: add(-0.7,"VIX ירד ≥4% ב-5 ימים")
 if R3>=1.02: add(1.35,"Backwardation / לחץ")
 elif R3<=0.94: add(-1.35,"Contango / רגיעה")
 
-# Nasdaq / S&P structure: EMA26 + short momentum
-add(1.0 if M<ME26 else -1.0, f"{market_name} מתחת EMA26" if M<ME26 else f"{market_name} מעל EMA26")
+# Nasdaq / S&P: no moving-average score; only short momentum and 12H support/resistance
 if M2<=-0.5: add(1.0,"מומנטום 2D שלילי")
 elif M2>=0.5: add(-1.0,"מומנטום 2D חיובי")
 if M5<=-1.0: add(0.6,"מומנטום 5D שלילי")
@@ -200,7 +253,7 @@ elif DIV12=="bearish": add(-0.75,"Bearish RSI Divergence ב-VIX 12H")
 if DIV4==DIV12=="bullish": add(0.35,"סנכרון Divergence ל-SHORT")
 elif DIV4==DIV12=="bearish": add(-0.35,"סנכרון Divergence ל-LONG")
 
-# Support / resistance from about one month of daily market structure
+# Support / resistance from about one month of 12H market structure
 if SR=="reject_resistance": add(0.5,"דחייה מהתנגדות")
 elif SR=="breakout": add(-0.6,"פריצה מעל התנגדות")
 elif SR=="bounce_support": add(-0.5,"תגובה מתמיכה")
@@ -280,15 +333,13 @@ def sr_text(s):
 d4,d4c=div_text(DIV4); d12,d12c=div_text(DIV12); srt,src=sr_text(SR)
 term_text="Risk-Off" if R3>=1.02 else ("Risk-On" if R3<=0.94 else "ניטרלי")
 term_cls="red" if R3>=1.02 else ("green" if R3<=0.94 else "white")
-market_text="מתחת EMA26" if M<ME26 else "מעל EMA26"; market_cls="red" if M<ME26 else "green"
 
 st.markdown('<div class="status-grid">'+
-    status_row("VIX · EMA9/26",ema_bias,ema_cls)+
-    status_row("Cross · EMA9/26",cross_text,cross_cls)+
+    status_row("VIX · EMA9/26 · 12H",ema_bias,ema_cls)+
+    status_row("Cross · EMA9/26 · 12H",cross_text,cross_cls)+
     status_row("Divergence 4H",d4,d4c)+
     status_row("Divergence 12H",d12,d12c)+
-    status_row("Support / Resistance",srt,src)+
-    status_row(f"{market_name} · EMA26",market_text,market_cls)+
+    status_row("Support / Resistance · 12H",srt,src)+
     status_row("Term Structure",term_text,term_cls)+
     status_row("VIX9D / VIX",("לחץ" if R9>=1.03 else ("רגוע" if R9<=0.97 else "מאוזן")),"red" if R9>=1.03 else ("green" if R9<=0.97 else "white"))+
     '</div>',unsafe_allow_html=True)
@@ -300,10 +351,10 @@ else: action="אין עסקה — המתן לסנכרון"
 st.markdown(f'<div class="panel" style="text-align:center;font-weight:900">{action}</div>',unsafe_allow_html=True)
 
 with st.expander("פירוט החישוב"):
-    st.write(f"VIX {V:.2f} · EMA9 {VE9:.2f} · EMA26 {VE26:.2f} · Cross proximity {CROSS_NEAR}/10")
+    st.write(f"VIX 12H {V12_LAST:.2f} · EMA9 {VE9:.2f} · EMA26 {VE26:.2f} · Cross proximity {CROSS_NEAR}/10")
     st.write(f"VIX 1D {C1:+.2f}% · 5D {C5:+.2f}% · VIX9D/VIX {R9:.3f} · VIX/VIX3M {R3:.3f}")
-    st.write(f"{market_name}: {'מעל' if M>ME26 else 'מתחת'} EMA26 · 2D {M2:+.2f}% · 5D {M5:+.2f}%")
-    st.write("RSI של VIX אינו מקבל ניקוד ישיר; הוא משמש רק לזיהוי Divergence ב-4H/12H.")
+    st.write(f"{market_name}: ללא EMA בציון · מומנטום 2D {M2:+.2f}% · 5D {M5:+.2f}% · Support/Resistance מחושב על 12H")
+    st.write("RSI של VIX אינו מקבל ניקוד ישיר; הוא משמש רק לזיהוי Divergence מאומת ב-4H/12H עם סינון רעש מחמיר.")
     for pts,txt in sorted(reasons,key=lambda z:abs(z[0]),reverse=True):
         st.write(f"**{pts:+.2f}** — {txt}")
 
