@@ -264,21 +264,12 @@ if V>=30: add(0.5,"VIX ≥30")
 elif V>=25: add(0.25,"VIX ≥25")
 elif V<15: add(-0.2,"VIX <15")
 
-# Single transparent signal score
-# Raw signed weights are normalized against the true maximum possible score in each direction.
-# Conflicting evidence cancels automatically inside the raw score, so no extra agreement metric is needed.
-MAX_SHORT_SCORE = 12.40
-MAX_LONG_SCORE = 11.70
-
-if score > 0:
-    signal_score = min(10.0, (float(score) / MAX_SHORT_SCORE) * 10.0)
-    signed_signal = signal_score
-elif score < 0:
-    signal_score = min(10.0, (abs(float(score)) / MAX_LONG_SCORE) * 10.0)
-    signed_signal = -signal_score
-else:
-    signal_score = 0.0
-    signed_signal = 0.0
+# One clear signal score
+# The internal weighted score and the visible scale now use the SAME units.
+# +5 raw points = SHORT threshold 5/10; -5 raw points = LONG threshold 5/10.
+# This keeps the score intuitive and avoids artificial compression against a theoretical maximum.
+signed_signal = max(-10.0, min(10.0, float(score)))
+signal_score = abs(signed_signal)
 
 ENTRY_THRESHOLD = 5.0
 STRONG_THRESHOLD = 7.0
@@ -316,7 +307,7 @@ st.markdown(f"""
     <div class="pointer" style="left:{pos:.1f}%"></div>
     <div class="gauge"><div class="midline"></div></div>
     <div class="gauge-labels"><span>LONG 10</span><span>WAIT 0</span><span>SHORT 10</span></div>
-    <div class="gauge-zones"><span>כניסה מ־5</span><span>ללא עסקה</span><span>כניסה מ־5</span></div>
+    <div class="gauge-zones"><span>LONG ≤ -5</span><span>WAIT</span><span>SHORT ≥ +5</span></div>
   </div>
 </div>
 """, unsafe_allow_html=True)
@@ -373,7 +364,7 @@ with st.expander("פירוט החישוב"):
     st.write(f"VIX 1D {C1:+.2f}% · 5D {C5:+.2f}% · VIX9D/VIX {R9:.3f} · VIX/VIX3M {R3:.3f}")
     st.write(f"{market_name}: ללא EMA בציון · מומנטום 2D {M2:+.2f}% · 5D {M5:+.2f}% · Support/Resistance מחושב על 12H")
     st.write("RSI של VIX אינו מקבל ניקוד ישיר; הוא משמש רק לזיהוי Divergence מאומת ב-4H/12H עם סינון רעש מחמיר.")
-    st.write(f"Raw score {score:+.2f} מתוך מקסימום תיאורטי ±{MAX_THEORETICAL_SCORE:.2f} → Directional {directional_score:+.2f}/10 · Agreement {agreement_pct:.0f}% · Trade Quality {trade_quality:.2f}/10")
+    st.write(f"ציון משוקלל נטו: {score:+.2f} → Signal Score {signal_score:.2f}/10 · כיוון: {'SHORT' if signed_signal>0 else ('LONG' if signed_signal<0 else 'NEUTRAL')}")
     for pts,txt in sorted(reasons,key=lambda z:abs(z[0]),reverse=True):
         st.write(f"**{pts:+.2f}** — {txt}")
 
