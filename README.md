@@ -1,23 +1,16 @@
-# VIX Swing — Simple Score UI
+# VIX Swing v10.1 — Multi-Source Resilient
 
-גרסה פשוטה ומעודכנת של אפליקציית VIX Swing.
+גרסה מחוזקת של VIX Swing עם מנגנון גיבוי למקורות נתונים.
 
-## עיקרי הלוגיקה
-- VIX מול EMA9
-- EMA9 מול EMA26 של VIX
-- Golden / Death Cross + מד קרבה 1–10
-- VIX9D / VIX
-- שינוי VIX יום אחד ו-5 ימים
-- Term Structure דרך VIX / VIX3M
-- Nasdaq/S&P מול EMA26 + מומנטום 2/5 ימים
-- RSI של VIX אינו מקבל ניקוד ישיר
-- RSI משמש רק ל-Divergence של VIX ב-4H וב-12H
-- Support / Resistance עד כחודש אחורה
-- סף אות: ±3.5
-- 15m אינו חלק מהאפליקציה; אישור סופי 1H
+## מה השתנה
+- Retry אוטומטי למשיכות Yahoo/yfinance.
+- מסלול גיבוי ישיר דרך Yahoo Chart API (query1/query2), במקרה שה-wrapper של yfinance נכשל.
+- גיבוי Daily רשמי של Cboe עבור VIX / VIX9D / VIX3M / VVIX.
+- גיבוי Daily עצמאי של Stooq עבור Nasdaq 100 / S&P 500.
+- אבחון ברור: האפליקציה מציגה איזה feed נכשל ומאיזה מקור כל סדרה התקבלה.
+- נתוני 12H נשארים קשיחים: אם אין נתוני 60m אמינים, האפליקציה לא מחליפה אותם ב-Daily כדי לא לשנות את לוגיקת השיטה.
 
-## הרצה
-```bash
-pip install -r requirements.txt
-streamlit run app.py
-```
+## Streamlit Cloud
+העלה את שלושת הקבצים (`app.py`, `requirements.txt`, `README.md`) לאותו repository והפעל את `app.py` כרגיל.
+
+אין צורך ב-API key לגרסה הזאת.

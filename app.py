@@ -2,6 +2,10 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import yfinance as yf
+import requests
+import time
+from io import StringIO
+from urllib.parse import quote
 from datetime import datetime
 
 st.set_page_config(page_title="VIX Swing", page_icon="🎯", layout="centered")
@@ -35,30 +39,231 @@ html,body,[class*="css"]{background:var(--bg);color:var(--txt)}
 </style>
 ''', unsafe_allow_html=True)
 
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_close(ticker, period="6mo", interval="1d"):
-    df = yf.download(ticker, period=period, interval=interval, auto_adjust=False, progress=False, threads=False)
+DATA_TIMEOUT = 8
+HTTP_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (VIX-Swing/10.1; Streamlit)",
+    "Accept": "application/json,text/csv,*/*",
+}
+
+# Official Cboe daily files. Used only as a fallback for daily volatility-index data.
+CBOE_SYMBOLS = {
+    "^VIX": "VIX",
+    "^VIX9D": "VIX9D",
+    "^VIX3M": "VIX3M",
+    "^VVIX": "VVIX",
+}
+
+STOOQ_SYMBOLS = {
+    "^NDX": "^ndx",
+    "^GSPC": "^spx",
+}
+
+def _mark_source(obj, source):
+    if obj is not None:
+        try:
+            obj.attrs["data_source"] = source
+        except Exception:
+            pass
+    return obj
+
+def source_name(obj):
+    try:
+        return obj.attrs.get("data_source", "לא ידוע") if obj is not None else "נכשל"
+    except Exception:
+        return "לא ידוע"
+
+def _extract_yf_close(df):
     if df is None or df.empty:
         return None
     if isinstance(df.columns, pd.MultiIndex):
         c = df["Close"] if "Close" in df.columns.get_level_values(0) else df.iloc[:, 0]
-        if isinstance(c, pd.DataFrame): c = c.iloc[:, 0]
+        if isinstance(c, pd.DataFrame):
+            c = c.iloc[:, 0]
     else:
+        if "Close" not in df.columns:
+            return None
         c = df["Close"]
-    return c.astype(float).dropna()
+    c = pd.to_numeric(c, errors="coerce").dropna().astype(float)
+    return c if len(c) else None
+
+def _extract_yf_ohlc(df):
+    if df is None or df.empty:
+        return None
+    if isinstance(df.columns, pd.MultiIndex):
+        out = pd.DataFrame(index=df.index)
+        for col in ["Open", "High", "Low", "Close"]:
+            if col not in df.columns.get_level_values(0):
+                return None
+            x = df[col]
+            if isinstance(x, pd.DataFrame):
+                x = x.iloc[:, 0]
+            out[col] = pd.to_numeric(x, errors="coerce")
+        return out.dropna()
+    needed = ["Open", "High", "Low", "Close"]
+    if not all(c in df.columns for c in needed):
+        return None
+    return df[needed].apply(pd.to_numeric, errors="coerce").dropna().astype(float)
+
+def _yfinance_download(ticker, period, interval):
+    """yfinance with short retry/backoff. Returns the raw DataFrame or None."""
+    for attempt in range(3):
+        try:
+            df = yf.download(
+                ticker,
+                period=period,
+                interval=interval,
+                auto_adjust=False,
+                progress=False,
+                threads=False,
+                timeout=DATA_TIMEOUT,
+            )
+            if df is not None and not df.empty:
+                return df
+        except TypeError:
+            # Compatibility with yfinance versions that do not expose timeout here.
+            try:
+                df = yf.download(
+                    ticker, period=period, interval=interval,
+                    auto_adjust=False, progress=False, threads=False
+                )
+                if df is not None and not df.empty:
+                    return df
+            except Exception:
+                pass
+        except Exception:
+            pass
+        time.sleep(0.6 * (attempt + 1))
+    return None
+
+def _yahoo_chart_df(ticker, period, interval):
+    """Independent Yahoo Chart API path; useful when the yfinance wrapper itself breaks."""
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{quote(ticker, safe='')}"
+    params = {
+        "range": period,
+        "interval": interval,
+        "includePrePost": "false",
+        "events": "div,splits",
+    }
+    for host in ["query1.finance.yahoo.com", "query2.finance.yahoo.com"]:
+        try:
+            u = url.replace("query1.finance.yahoo.com", host)
+            r = requests.get(u, params=params, headers=HTTP_HEADERS, timeout=DATA_TIMEOUT)
+            r.raise_for_status()
+            payload = r.json()
+            result = (payload.get("chart", {}).get("result") or [None])[0]
+            if not result:
+                continue
+            ts = result.get("timestamp") or []
+            quote_data = ((result.get("indicators") or {}).get("quote") or [{}])[0]
+            if not ts or not quote_data:
+                continue
+            tz = (result.get("meta") or {}).get("exchangeTimezoneName") or "America/New_York"
+            idx = pd.to_datetime(ts, unit="s", utc=True)
+            try:
+                idx = idx.tz_convert(tz)
+            except Exception:
+                pass
+            out = pd.DataFrame(index=idx)
+            for src, dst in [("open","Open"),("high","High"),("low","Low"),("close","Close")]:
+                vals = quote_data.get(src)
+                if vals is not None and len(vals) == len(idx):
+                    out[dst] = pd.to_numeric(vals, errors="coerce")
+            if "Close" in out.columns and out["Close"].notna().sum() > 0:
+                return out
+        except Exception:
+            continue
+    return None
+
+def _cboe_daily_close(ticker):
+    """Official Cboe daily history fallback for VIX-family indices."""
+    symbol = CBOE_SYMBOLS.get(ticker)
+    if not symbol:
+        return None
+    url = f"https://cdn.cboe.com/api/global/us_indices/daily_prices/{symbol}_History.csv"
+    try:
+        r = requests.get(url, headers=HTTP_HEADERS, timeout=DATA_TIMEOUT)
+        r.raise_for_status()
+        df = pd.read_csv(StringIO(r.text))
+        df.columns = [str(c).strip().upper() for c in df.columns]
+        if "DATE" not in df.columns:
+            return None
+        close_col = "CLOSE" if "CLOSE" in df.columns else (symbol if symbol in df.columns else None)
+        if close_col is None:
+            # Some Cboe one-column histories use a nonstandard value header.
+            candidates = [c for c in df.columns if c != "DATE"]
+            close_col = candidates[-1] if candidates else None
+        if close_col is None:
+            return None
+        idx = pd.to_datetime(df["DATE"], errors="coerce")
+        vals = pd.to_numeric(df[close_col], errors="coerce")
+        s = pd.Series(vals.values, index=idx).dropna().sort_index().astype(float)
+        return s if len(s) else None
+    except Exception:
+        return None
+
+def _stooq_daily_close(ticker):
+    """Independent daily-index fallback for NDX/SPX."""
+    symbol = STOOQ_SYMBOLS.get(ticker)
+    if not symbol:
+        return None
+    try:
+        url = f"https://stooq.com/q/d/l/?s={quote(symbol)}&i=d"
+        r = requests.get(url, headers=HTTP_HEADERS, timeout=DATA_TIMEOUT)
+        r.raise_for_status()
+        df = pd.read_csv(StringIO(r.text))
+        if "Date" not in df.columns or "Close" not in df.columns:
+            return None
+        idx = pd.to_datetime(df["Date"], errors="coerce")
+        vals = pd.to_numeric(df["Close"], errors="coerce")
+        s = pd.Series(vals.values, index=idx).dropna().sort_index().astype(float)
+        return s if len(s) else None
+    except Exception:
+        return None
+
+def _tail_for_period(s, period):
+    if s is None:
+        return None
+    # We only need enough history for the app's indicators. Keeping a bounded tail
+    # also avoids carrying decades of Cboe/Stooq data through Streamlit cache.
+    n = {"1mo": 35, "3mo": 90, "6mo": 180, "1y": 300}.get(period, 300)
+    return s.iloc[-n:]
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_close(ticker, period="6mo", interval="1d"):
+    # 1) yfinance wrapper
+    df = _yfinance_download(ticker, period, interval)
+    c = _extract_yf_close(df)
+    if c is not None and len(c):
+        return _mark_source(c, "Yahoo / yfinance")
+
+    # 2) Direct Yahoo Chart API through two hosts (independent code path)
+    df = _yahoo_chart_df(ticker, period, interval)
+    c = _extract_yf_close(df)
+    if c is not None and len(c):
+        return _mark_source(c, "Yahoo Chart API")
+
+    # 3) Truly independent official/secondary daily fallbacks
+    if interval == "1d":
+        c = _cboe_daily_close(ticker)
+        if c is not None and len(c):
+            return _mark_source(_tail_for_period(c, period), "Cboe official")
+        c = _stooq_daily_close(ticker)
+        if c is not None and len(c):
+            return _mark_source(_tail_for_period(c, period), "Stooq")
+    return None
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_ohlc(ticker, period="3mo", interval="1d"):
-    df = yf.download(ticker, period=period, interval=interval, auto_adjust=False, progress=False, threads=False)
-    if df is None or df.empty: return None
-    if isinstance(df.columns, pd.MultiIndex):
-        out = pd.DataFrame(index=df.index)
-        for col in ["Open","High","Low","Close"]:
-            x = df[col]
-            if isinstance(x, pd.DataFrame): x = x.iloc[:,0]
-            out[col] = x.astype(float)
-        return out.dropna()
-    return df[["Open","High","Low","Close"]].astype(float).dropna()
+    df = _yfinance_download(ticker, period, interval)
+    out = _extract_yf_ohlc(df)
+    if out is not None and len(out):
+        return _mark_source(out, "Yahoo / yfinance")
+
+    df = _yahoo_chart_df(ticker, period, interval)
+    out = _extract_yf_ohlc(df)
+    if out is not None and len(out):
+        return _mark_source(out, "Yahoo Chart API")
+    return None
 
 def ema_series(s,n): return s.ewm(span=n,adjust=False).mean()
 def pctn(s,n): return float((s.iloc[-1]/s.iloc[-1-n]-1)*100) if s is not None and len(s)>n else np.nan
@@ -245,15 +450,36 @@ with st.spinner("מחשב..."):
     m_intra=fetch_close(market_ticker,period="60d",interval="60m")
     mo_intra=fetch_ohlc(market_ticker,period="60d",interval="60m")
 
-if any(x is None or len(x)<30 for x in [v,v9,v3,m]):
-    st.error("לא הצלחתי למשוך כרגע את כל הנתונים. נסה רענון."); st.stop()
+required_daily = {
+    "VIX": v,
+    "VIX9D": v9,
+    "VIX3M": v3,
+    market_name: m,
+}
+failed_daily = [name for name, x in required_daily.items() if x is None or len(x) < 30]
+if failed_daily:
+    st.error("לא הצלחתי להשיג נתונים תקינים עבור: " + ", ".join(failed_daily) + ". ניסיתי Yahoo, מקור Yahoo ישיר, ובמידת האפשר גם Cboe/Stooq.")
+    with st.expander("אבחון מקורות נתונים"):
+        for name, x in required_daily.items():
+            st.write(f"{name}: {'✅' if x is not None and len(x)>=30 else '❌'} · {source_name(x)} · {len(x) if x is not None else 0} נקודות")
+    st.stop()
 
 V=float(v.iloc[-1]); V9=float(v9.iloc[-1]); V3=float(v3.iloc[-1]); VV=float(vv.iloc[-1]) if vv is not None and len(vv) else np.nan
 V12=resample_close(v_intra,12)
 M12=resample_close(m_intra,12)
 MO12=resample_ohlc(mo_intra,12)
 if V12 is None or len(V12)<30 or M12 is None or len(M12)<20 or MO12 is None or len(MO12)<20:
-    st.error("לא הצלחתי לבנות כרגע נתוני 12H. נסה רענון."); st.stop()
+    failed_intraday=[]
+    if V12 is None or len(V12)<30: failed_intraday.append("VIX 60m → 12H")
+    if M12 is None or len(M12)<20: failed_intraday.append(f"{market_name} 60m → 12H")
+    if MO12 is None or len(MO12)<20: failed_intraday.append(f"{market_name} OHLC 60m → 12H")
+    st.error("לא הצלחתי לבנות נתוני 12H עבור: " + ", ".join(failed_intraday) + ". בוצעו ניסיונות חוזרים דרך yfinance וגם דרך Yahoo Chart API ישיר.")
+    with st.expander("אבחון מקורות נתונים"):
+        st.write(f"VIX 60m: {source_name(v_intra)} · {len(v_intra) if v_intra is not None else 0} נקודות")
+        st.write(f"{market_name} 60m: {source_name(m_intra)} · {len(m_intra) if m_intra is not None else 0} נקודות")
+        st.write(f"{market_name} OHLC 60m: {source_name(mo_intra)} · {len(mo_intra) if mo_intra is not None else 0} נקודות")
+        st.caption("נתוני 12H הם חלק קריטי מהשיטה, לכן האפליקציה לא מחליפה אותם בנתוני Daily שעלולים לשנות את האות.")
+    st.stop()
 V12_LAST=float(V12.iloc[-1])
 VE9,VE26,CROSS,CROSS_AGE,APPROACH,CROSS_NEAR,GAP=cross_status(V12)
 C1=pctn(v,1); C5=pctn(v,5); R9=V9/V; R3=V/V3
@@ -418,4 +644,13 @@ with st.expander("פירוט החישוב"):
     for pts,txt in sorted(reasons,key=lambda z:abs(z[0]),reverse=True):
         st.write(f"**{pts:+.2f}** — {txt}")
 
-st.caption(f"עודכן {datetime.now().strftime('%H:%M')} · נתונים: Yahoo Finance / yfinance · כלי מחקרי, לא ייעוץ השקעות")
+with st.expander("מקורות נתונים / גיבוי"):
+    st.write(f"VIX Daily: **{source_name(v)}**")
+    st.write(f"VIX9D Daily: **{source_name(v9)}**")
+    st.write(f"VIX3M Daily: **{source_name(v3)}**")
+    st.write(f"{market_name} Daily: **{source_name(m)}**")
+    st.write(f"VIX 60m: **{source_name(v_intra)}**")
+    st.write(f"{market_name} 60m: **{source_name(m_intra)}**")
+    st.caption("סדר הגיבוי: Yahoo/yfinance → Yahoo Chart API ישיר. לנתוני Daily בלבד: Cboe הרשמי למדדי VIX, ו-Stooq למדדי NDX/SPX.")
+
+st.caption(f"עודכן {datetime.now().strftime('%H:%M')} · מנגנון Multi-Source + Retry פעיל · כלי מחקרי, לא ייעוץ השקעות")
