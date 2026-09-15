@@ -1,11 +1,23 @@
-# VIX Swing Game UI — High Contrast
-Improved iPhone readability and text contrast.
+# VIX Swing — Simple Score UI
 
-## VIX Swing update — RSI Divergence
-- Added RSI divergence detection on VIX 4H and 12H, built from hourly VIX observations.
-- 4H bullish/bearish divergence contributes +0.45 / -0.45 to the score.
-- 12H bullish/bearish divergence contributes +0.75 / -0.75.
-- Matching divergence on both timeframes adds an extra +0.35 / -0.35 synchronization bonus.
-- Positive score supports Risk-Off / equity SHORT; negative score supports Risk-On / equity LONG.
-- Final lower-timeframe confirmation is 1H only; 15m confirmation was removed.
+גרסה פשוטה ומעודכנת של אפליקציית VIX Swing.
 
+## עיקרי הלוגיקה
+- VIX מול EMA9
+- EMA9 מול EMA26 של VIX
+- Golden / Death Cross + מד קרבה 1–10
+- VIX9D / VIX
+- שינוי VIX יום אחד ו-5 ימים
+- Term Structure דרך VIX / VIX3M
+- Nasdaq/S&P מול EMA26 + מומנטום 2/5 ימים
+- RSI של VIX אינו מקבל ניקוד ישיר
+- RSI משמש רק ל-Divergence של VIX ב-4H וב-12H
+- Support / Resistance עד כחודש אחורה
+- סף אות: ±3.5
+- 15m אינו חלק מהאפליקציה; אישור סופי 1H
+
+## הרצה
+```bash
+pip install -r requirements.txt
+streamlit run app.py
+```
