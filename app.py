@@ -175,29 +175,58 @@ def _yahoo_chart_df(ticker, period, interval):
     return None
 
 def _cboe_daily_close(ticker):
-    """Official Cboe daily history fallback for VIX-family indices."""
+    """Official Cboe daily history fallback for VIX-family indices.
+
+    Cboe migrated the live CSV host from cdn.cboe.com to cdn-api.cboe.com.
+    Try the current host first and keep the older host as a compatibility fallback.
+    """
     symbol = CBOE_SYMBOLS.get(ticker)
     if not symbol:
         return None
-    url = f"https://cdn.cboe.com/api/global/us_indices/daily_prices/{symbol}_History.csv"
+    for host in ["https://cdn-api.cboe.com", "https://cdn.cboe.com"]:
+        url = f"{host}/api/global/us_indices/daily_prices/{symbol}_History.csv"
+        try:
+            r = requests.get(url, headers=HTTP_HEADERS, timeout=DATA_TIMEOUT)
+            r.raise_for_status()
+            df = pd.read_csv(StringIO(r.text))
+            df.columns = [str(c).strip().upper() for c in df.columns]
+            if "DATE" not in df.columns:
+                continue
+            close_col = "CLOSE" if "CLOSE" in df.columns else (symbol if symbol in df.columns else None)
+            if close_col is None:
+                candidates = [c for c in df.columns if c != "DATE"]
+                close_col = candidates[-1] if candidates else None
+            if close_col is None:
+                continue
+            idx = pd.to_datetime(df["DATE"], errors="coerce")
+            vals = pd.to_numeric(df[close_col], errors="coerce")
+            out = pd.Series(vals.values, index=idx).dropna().sort_index().astype(float)
+            if len(out):
+                return out
+        except Exception:
+            continue
+    return None
+
+def _fred_daily_close(ticker):
+    """FRED fallback for selected Cboe daily series; no API key required."""
+    series_map = {
+        "^VIX": "VIXCLS",
+        "^VIX3M": "VXVCLS",  # CBOE S&P 500 3-Month Volatility Index
+    }
+    series_id = series_map.get(ticker)
+    if not series_id:
+        return None
     try:
+        url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
         r = requests.get(url, headers=HTTP_HEADERS, timeout=DATA_TIMEOUT)
         r.raise_for_status()
         df = pd.read_csv(StringIO(r.text))
-        df.columns = [str(c).strip().upper() for c in df.columns]
-        if "DATE" not in df.columns:
-            return None
-        close_col = "CLOSE" if "CLOSE" in df.columns else (symbol if symbol in df.columns else None)
-        if close_col is None:
-            # Some Cboe one-column histories use a nonstandard value header.
-            candidates = [c for c in df.columns if c != "DATE"]
-            close_col = candidates[-1] if candidates else None
-        if close_col is None:
+        if "DATE" not in df.columns or series_id not in df.columns:
             return None
         idx = pd.to_datetime(df["DATE"], errors="coerce")
-        vals = pd.to_numeric(df[close_col], errors="coerce")
-        s = pd.Series(vals.values, index=idx).dropna().sort_index().astype(float)
-        return s if len(s) else None
+        vals = pd.to_numeric(df[series_id].replace(".", np.nan), errors="coerce")
+        out = pd.Series(vals.values, index=idx).dropna().sort_index().astype(float)
+        return out if len(out) else None
     except Exception:
         return None
 
@@ -228,28 +257,46 @@ def _tail_for_period(s, period):
     n = {"1mo": 35, "3mo": 90, "6mo": 180, "1y": 300}.get(period, 300)
     return s.iloc[-n:]
 
+def _min_points_required(period, interval):
+    # Reject obviously broken responses (for example Yahoo returning a single row).
+    if interval == "1d":
+        return 20 if period == "1mo" else 30
+    return 30
+
+def _valid_history(s, period, interval):
+    return s is not None and len(s) >= _min_points_required(period, interval)
+
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_close(ticker, period="6mo", interval="1d"):
-    # 1) yfinance wrapper
+    # 1) yfinance wrapper. A non-empty result is not enough: Yahoo sometimes
+    # returns only one bar for VIX9D/VIX3M, which is unusable for indicators.
     df = _yfinance_download(ticker, period, interval)
     c = _extract_yf_close(df)
-    if c is not None and len(c):
+    if _valid_history(c, period, interval):
         return _mark_source(c, "Yahoo / yfinance")
 
-    # 2) Direct Yahoo Chart API through two hosts (independent code path)
+    # 2) Direct Yahoo Chart API through two hosts.
     df = _yahoo_chart_df(ticker, period, interval)
     c = _extract_yf_close(df)
-    if c is not None and len(c):
+    if _valid_history(c, period, interval):
         return _mark_source(c, "Yahoo Chart API")
 
-    # 3) Truly independent official/secondary daily fallbacks
+    # 3) Independent daily fallbacks.
     if interval == "1d":
         c = _cboe_daily_close(ticker)
-        if c is not None and len(c):
-            return _mark_source(_tail_for_period(c, period), "Cboe official")
+        c = _tail_for_period(c, period) if c is not None else None
+        if _valid_history(c, period, interval):
+            return _mark_source(c, "Cboe official")
+
+        c = _fred_daily_close(ticker)
+        c = _tail_for_period(c, period) if c is not None else None
+        if _valid_history(c, period, interval):
+            return _mark_source(c, "FRED / Cboe")
+
         c = _stooq_daily_close(ticker)
-        if c is not None and len(c):
-            return _mark_source(_tail_for_period(c, period), "Stooq")
+        c = _tail_for_period(c, period) if c is not None else None
+        if _valid_history(c, period, interval):
+            return _mark_source(c, "Stooq")
     return None
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -458,7 +505,7 @@ required_daily = {
 }
 failed_daily = [name for name, x in required_daily.items() if x is None or len(x) < 30]
 if failed_daily:
-    st.error("לא הצלחתי להשיג נתונים תקינים עבור: " + ", ".join(failed_daily) + ". ניסיתי Yahoo, מקור Yahoo ישיר, ובמידת האפשר גם Cboe/Stooq.")
+    st.error("לא הצלחתי להשיג נתונים תקינים עבור: " + ", ".join(failed_daily) + ". ניסיתי Yahoo, מקור Yahoo ישיר, Cboe הרשמי, FRED ובמידת האפשר גם Stooq.")
     with st.expander("אבחון מקורות נתונים"):
         for name, x in required_daily.items():
             st.write(f"{name}: {'✅' if x is not None and len(x)>=30 else '❌'} · {source_name(x)} · {len(x) if x is not None else 0} נקודות")
