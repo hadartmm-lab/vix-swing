@@ -69,17 +69,67 @@ def rsi_series(s,n=14):
     rs=au/ad.replace(0,np.nan)
     return 100-100/(1+rs)
 
-def resample_close(s,hours):
-    if s is None or len(s)<20 or not isinstance(s.index,pd.DatetimeIndex): return None
-    try: return s.resample(f"{hours}h").last().dropna()
-    except Exception: return None
-
-
-
-def resample_ohlc(df,hours):
-    if df is None or len(df)<20 or not isinstance(df.index,pd.DatetimeIndex): return None
+def _to_new_york_index(obj):
+    """Return a copy indexed in America/New_York for stable US-market session bars."""
+    if obj is None or not isinstance(obj.index, pd.DatetimeIndex):
+        return None
+    x = obj.copy()
+    idx = x.index
     try:
-        out=df.resample(f"{hours}h").agg({"Open":"first","High":"max","Low":"min","Close":"last"}).dropna()
+        if idx.tz is None:
+            # Yahoo intraday data for US tickers is normally exchange-local;
+            # make that assumption explicit rather than letting resample anchor to UTC/local host time.
+            idx = idx.tz_localize("America/New_York", ambiguous="infer", nonexistent="shift_forward")
+        else:
+            idx = idx.tz_convert("America/New_York")
+        x.index = idx
+        return x.sort_index()
+    except Exception:
+        return None
+
+def resample_close(s, hours):
+    """Build 4H/12H bars anchored to the US regular session (09:30 ET).
+
+    This avoids midnight/UTC bucket drift. 4H bars become 09:30-13:30 and
+    13:30-close; a 12H bar starts at 09:30 and contains the full regular
+    session. Empty overnight buckets are discarded.
+    """
+    if s is None or len(s) < 20 or not isinstance(s.index, pd.DatetimeIndex):
+        return None
+    x = _to_new_york_index(s)
+    if x is None:
+        return None
+    try:
+        # Keep regular US market session only. Yahoo hourly stamps can be 09:30 or 09:00
+        # depending on feed normalization, so include 09:00 then anchor buckets at 09:30.
+        x = x.between_time("09:00", "16:00", inclusive="both")
+        out = x.resample(
+            f"{hours}h",
+            origin="start_day",
+            offset="9h30min",
+            label="left",
+            closed="left",
+        ).last().dropna()
+        return out
+    except Exception:
+        return None
+
+def resample_ohlc(df, hours):
+    """Build session-anchored OHLC bars in America/New_York."""
+    if df is None or len(df) < 20 or not isinstance(df.index, pd.DatetimeIndex):
+        return None
+    x = _to_new_york_index(df)
+    if x is None:
+        return None
+    try:
+        x = x.between_time("09:00", "16:00", inclusive="both")
+        out = x.resample(
+            f"{hours}h",
+            origin="start_day",
+            offset="9h30min",
+            label="left",
+            closed="left",
+        ).agg({"Open":"first","High":"max","Low":"min","Close":"last"}).dropna()
         return out
     except Exception:
         return None
