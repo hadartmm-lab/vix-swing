@@ -13,17 +13,20 @@ html,body,[class*="css"]{background:var(--bg);color:var(--txt)}
 .stApp{background:linear-gradient(180deg,#07131f 0%,#081725 100%)}
 .block-container{max-width:820px;padding-top:.8rem;padding-bottom:2rem}
 .hero{background:#0b1f31;border:1px solid var(--line);border-radius:20px;padding:16px 18px;margin-bottom:12px}
-.hero-title{font-size:1.7rem;font-weight:900}.muted{color:var(--muted);font-size:.88rem}
-.signal{background:#0b1f31;border:1px solid var(--line);border-radius:22px;padding:18px;margin:12px 0;text-align:center}
-.signal-title{font-size:2rem;font-weight:950;margin-bottom:4px}.score{font-size:1rem;color:#dfe9f2}
-.gauge-wrap{margin:20px 4px 6px;position:relative;padding-top:22px}
-.gauge{height:18px;border-radius:999px;background:linear-gradient(90deg,#0f6b45 0%,#1a557c 28%,#746519 50%,#8a4d13 72%,#7b1d26 100%);border:1px solid rgba(255,255,255,.16);position:relative}
-.pointer{position:absolute;top:0;transform:translateX(-50%);font-size:1.45rem;line-height:1}
-.gauge-labels{display:flex;justify-content:space-between;font-size:.72rem;color:#d4e0ea;margin-top:6px}
+.hero-title{font-size:1.7rem;font-weight:950;color:#ffffff}.muted{color:#c9d7e3;font-size:.88rem}
+.signal{background:linear-gradient(180deg,#0c2235 0%,#091b2b 100%);border:1px solid #245a7f;border-radius:24px;padding:20px 18px 18px;margin:12px 0;text-align:center;box-shadow:0 10px 35px rgba(0,0,0,.20)}
+.signal-title{font-size:2.15rem;font-weight:950;margin-bottom:3px}.score{font-size:1rem;color:#e7f0f7}.confidence{font-size:.84rem;color:#a9bdcc;margin-top:3px}
+.gauge-wrap{margin:22px 3px 8px;position:relative;padding-top:30px}
+.gauge{height:22px;border-radius:999px;background:linear-gradient(90deg,#0d7a50 0%,#197b6d 18%,#356f78 34%,#55626c 46%,#6a624b 50%,#7f6037 54%,#96602a 66%,#a64d28 82%,#9a2632 100%);border:1px solid rgba(255,255,255,.22);position:relative;box-shadow:inset 0 1px 3px rgba(255,255,255,.12),0 4px 14px rgba(0,0,0,.22)}
+.gauge:before,.gauge:after{content:"";position:absolute;top:-4px;bottom:-4px;width:2px;background:rgba(255,255,255,.75);border-radius:2px}.gauge:before{left:25%}.gauge:after{left:75%}
+.midline{position:absolute;left:50%;top:-4px;bottom:-4px;width:2px;background:rgba(255,255,255,.4);border-radius:2px}
+.pointer{position:absolute;top:0;transform:translateX(-50%);width:0;height:0;border-left:9px solid transparent;border-right:9px solid transparent;border-top:15px solid #ffffff;filter:drop-shadow(0 2px 3px rgba(0,0,0,.45))}
+.gauge-labels{display:grid;grid-template-columns:1fr 1fr 1fr;font-size:.72rem;color:#dbe7f0;margin-top:9px;font-weight:800}.gauge-labels span:nth-child(1){text-align:left}.gauge-labels span:nth-child(2){text-align:center}.gauge-labels span:nth-child(3){text-align:right}
+.gauge-zones{display:grid;grid-template-columns:1fr 1fr 1fr;font-size:.64rem;color:#8fa7b9;margin-top:3px}.gauge-zones span:nth-child(1){text-align:left}.gauge-zones span:nth-child(2){text-align:center}.gauge-zones span:nth-child(3){text-align:right}
 .status-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:9px;margin-top:10px}
 @media(max-width:640px){.status-grid{grid-template-columns:1fr}}
-.status{background:#0a1a28;border:1px solid #173f5d;border-radius:15px;padding:12px 13px;display:flex;justify-content:space-between;align-items:center;gap:12px}
-.status-name{font-weight:800;font-size:.92rem}.status-val{font-weight:900;text-align:left;white-space:nowrap}
+.status{background:#0a1a28;border:1px solid #214d6b;border-radius:15px;padding:11px 13px;display:flex;justify-content:space-between;align-items:center;gap:12px}
+.status-name{font-weight:850;font-size:.92rem;color:#eef5fa}.status-val{font-weight:900;text-align:left;white-space:nowrap}
 .green{color:#72e8a7}.red{color:#ff8c92}.orange{color:#ffc06d}.blue{color:#82c9ff}.yellow{color:#ffe47b}.white{color:#fff}
 .panel{background:#0b1f31;border:1px solid var(--line);border-radius:18px;padding:14px;margin-top:11px}
 .stButton>button{width:100%;border-radius:14px;border:1px solid #1f6fa0;background:#0c2d46;color:white;font-weight:850;padding:.65rem 1rem}
@@ -208,32 +211,50 @@ if V>=30: add(0.5,"VIX ≥30")
 elif V>=25: add(0.25,"VIX ≥25")
 elif V<15: add(-0.2,"VIX <15")
 
-# Final threshold ±3.5
-if score>=5.5: state,icon,cls="STRONG SHORT","🔴","red"
-elif score>=3.5: state,icon,cls="SHORT","🟠","orange"
-elif score<=-5.5: state,icon,cls="STRONG LONG","🟢","green"
-elif score<=-3.5: state,icon,cls="LONG","🔵","blue"
-else: state,icon,cls="WAIT","🟡","yellow"
+# Final threshold: require stronger agreement before looking for a trade.
+# UI uses a directional -10..+10 scale; values are clipped only for display.
+ENTRY_THRESHOLD = 5.0
+STRONG_THRESHOLD = 7.0
+VERY_STRONG_THRESHOLD = 8.5
+ui_score = max(-10.0, min(10.0, float(score)))
+strength = abs(ui_score)
 
-# Gauge: -10 = far left (LONG), +10 = far right (SHORT)
-pos=max(2,min(98,(score+10)/20*100))
-st.markdown(f'''
+if ui_score >= VERY_STRONG_THRESHOLD:
+    state,icon,cls = "VERY STRONG SHORT","🔴","red"
+elif ui_score >= STRONG_THRESHOLD:
+    state,icon,cls = "STRONG SHORT","🔴","red"
+elif ui_score >= ENTRY_THRESHOLD:
+    state,icon,cls = "SHORT","🟠","orange"
+elif ui_score <= -VERY_STRONG_THRESHOLD:
+    state,icon,cls = "VERY STRONG LONG","🟢","green"
+elif ui_score <= -STRONG_THRESHOLD:
+    state,icon,cls = "STRONG LONG","🟢","green"
+elif ui_score <= -ENTRY_THRESHOLD:
+    state,icon,cls = "LONG","🔵","blue"
+else:
+    state,icon,cls = "WAIT","🟡","yellow"
+
+# Gauge: -10 = LONG, 0 = WAIT, +10 = SHORT. Entry zones begin at ±5.
+pos = max(2, min(98, (ui_score+10)/20*100))
+st.markdown(f"""
 <div class="signal">
   <div class="signal-title {cls}">{icon} {state}</div>
-  <div class="score">Score <b>{score:+.2f}</b> · כניסה לכיוון רק מ-±3.5</div>
+  <div class="score">Score <b>{ui_score:+.1f}</b> / 10</div>
+  <div class="confidence">כניסה לחיפוש עסקה רק מ־<b>5.0/10</b> בכיוון ברור</div>
   <div class="gauge-wrap">
-    <div class="pointer" style="left:{pos:.1f}%">▼</div>
-    <div class="gauge"></div>
-    <div class="gauge-labels"><span>STRONG LONG</span><span>WAIT</span><span>STRONG SHORT</span></div>
+    <div class="pointer" style="left:{pos:.1f}%"></div>
+    <div class="gauge"><div class="midline"></div></div>
+    <div class="gauge-labels"><span>LONG 10</span><span>WAIT 0</span><span>SHORT 10</span></div>
+    <div class="gauge-zones"><span>כניסה ≤ −5</span><span>ללא עסקה</span><span>כניסה ≥ +5</span></div>
   </div>
 </div>
-''',unsafe_allow_html=True)
+""", unsafe_allow_html=True)
 
 # Compact statuses
 ema_bias="SHORT" if VE9>VE26 else "LONG"
 ema_cls="red" if ema_bias=="SHORT" else "green"
 if CROSS and CROSS_AGE is not None and CROSS_AGE<=5:
-    cross_text=("Golden Cross" if CROSS=="golden" else "Death Cross")+" · 10/10"
+    cross_text=("Golden Cross" if CROSS=="golden" else "Death Cross")+" · קרבה 10/10"
     cross_cls="red" if CROSS=="golden" else "green"
 elif APPROACH:
     cross_text=("Golden מתקרב" if APPROACH=="golden" else "Death מתקרב")+f" · {CROSS_NEAR}/10"
