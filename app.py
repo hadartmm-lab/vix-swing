@@ -15,7 +15,7 @@ html,body,[class*="css"]{background:var(--bg);color:var(--txt)}
 .hero{background:#0b1f31;border:1px solid var(--line);border-radius:20px;padding:16px 18px;margin-bottom:12px}
 .hero-title{font-size:1.7rem;font-weight:950;color:#ffffff}.muted{color:#c9d7e3;font-size:.88rem}
 .signal{background:linear-gradient(180deg,#0c2235 0%,#091b2b 100%);border:1px solid #245a7f;border-radius:24px;padding:20px 18px 18px;margin:12px 0;text-align:center;box-shadow:0 10px 35px rgba(0,0,0,.20)}
-.signal-title{font-size:2.15rem;font-weight:950;margin-bottom:3px}.score{font-size:1rem;color:#e7f0f7}.confidence{font-size:.84rem;color:#a9bdcc;margin-top:3px}.metrics{display:grid;grid-template-columns:1fr 1fr;gap:9px;margin:14px 0 2px}.metric{background:#081826;border:1px solid #214d6b;border-radius:13px;padding:10px}.metric-k{font-size:.72rem;color:#9fb3c3;font-weight:800}.metric-v{font-size:1.18rem;color:#fff;font-weight:950;margin-top:2px}
+.signal-title{font-size:2.15rem;font-weight:950;margin-bottom:3px}.score{font-size:1.45rem;color:#ffffff;font-weight:950;margin-top:8px}.confidence{font-size:.86rem;color:#b8c9d7;margin-top:6px}
 .gauge-wrap{margin:22px 3px 8px;position:relative;padding-top:30px}
 .gauge{height:22px;border-radius:999px;background:linear-gradient(90deg,#0d7a50 0%,#197b6d 18%,#356f78 34%,#55626c 46%,#6a624b 50%,#7f6037 54%,#96602a 66%,#a64d28 82%,#9a2632 100%);border:1px solid rgba(255,255,255,.22);position:relative;box-shadow:inset 0 1px 3px rgba(255,255,255,.12),0 4px 14px rgba(0,0,0,.22)}
 .gauge:before,.gauge:after{content:"";position:absolute;top:-4px;bottom:-4px;width:2px;background:rgba(255,255,255,.75);border-radius:2px}.gauge:before{left:25%}.gauge:after{left:75%}
@@ -264,61 +264,59 @@ if V>=30: add(0.5,"VIX ≥30")
 elif V>=25: add(0.25,"VIX ≥25")
 elif V<15: add(-0.2,"VIX <15")
 
-# Transparent scoring model
-# 1) Raw score keeps the original signed weights.
-# 2) Directional Score normalizes raw score to a true -10..+10 scale using the theoretical maximum weight.
-# 3) Agreement measures how much of the ACTIVE evidence points in the dominant direction.
-# 4) Trade Quality combines directional strength and agreement; it is an internal setup-quality score, NOT a probability.
-MAX_THEORETICAL_SCORE = 12.40
-positive_weight = sum(p for p,_ in reasons if p > 0)
-negative_weight = sum(-p for p,_ in reasons if p < 0)
-active_weight = positive_weight + negative_weight
+# Single transparent signal score
+# Raw signed weights are normalized against the true maximum possible score in each direction.
+# Conflicting evidence cancels automatically inside the raw score, so no extra agreement metric is needed.
+MAX_SHORT_SCORE = 12.40
+MAX_LONG_SCORE = 11.70
 
-directional_score = max(-10.0, min(10.0, (float(score) / MAX_THEORETICAL_SCORE) * 10.0))
-agreement_pct = (max(positive_weight, negative_weight) / active_weight * 100.0) if active_weight > 0 else 0.0
-trade_quality = min(10.0, abs(directional_score) * (agreement_pct / 100.0))
+if score > 0:
+    signal_score = min(10.0, (float(score) / MAX_SHORT_SCORE) * 10.0)
+    signed_signal = signal_score
+elif score < 0:
+    signal_score = min(10.0, (abs(float(score)) / MAX_LONG_SCORE) * 10.0)
+    signed_signal = -signal_score
+else:
+    signal_score = 0.0
+    signed_signal = 0.0
 
-# Entry requires BOTH enough net direction and enough agreement.
-ENTRY_DIRECTION = 5.0
-ENTRY_AGREEMENT = 65.0
-STRONG_QUALITY = 7.0
-VERY_STRONG_QUALITY = 8.5
+ENTRY_THRESHOLD = 5.0
+STRONG_THRESHOLD = 7.0
+VERY_STRONG_THRESHOLD = 8.5
 
-qualified = abs(directional_score) >= ENTRY_DIRECTION and agreement_pct >= ENTRY_AGREEMENT and trade_quality >= 5.0
-
-if qualified and directional_score > 0:
-    if trade_quality >= VERY_STRONG_QUALITY:
-        state,icon,cls = "VERY STRONG SHORT","🔴","red"
-    elif trade_quality >= STRONG_QUALITY:
-        state,icon,cls = "STRONG SHORT","🔴","red"
-    else:
-        state,icon,cls = "SHORT","🟠","orange"
-elif qualified and directional_score < 0:
-    if trade_quality >= VERY_STRONG_QUALITY:
-        state,icon,cls = "VERY STRONG LONG","🟢","green"
-    elif trade_quality >= STRONG_QUALITY:
-        state,icon,cls = "STRONG LONG","🟢","green"
-    else:
-        state,icon,cls = "LONG","🔵","blue"
+if signed_signal >= VERY_STRONG_THRESHOLD:
+    state,icon,cls = "VERY STRONG SHORT","🔴","red"
+elif signed_signal >= STRONG_THRESHOLD:
+    state,icon,cls = "STRONG SHORT","🔴","red"
+elif signed_signal >= ENTRY_THRESHOLD:
+    state,icon,cls = "SHORT","🟠","orange"
+elif signed_signal <= -VERY_STRONG_THRESHOLD:
+    state,icon,cls = "VERY STRONG LONG","🟢","green"
+elif signed_signal <= -STRONG_THRESHOLD:
+    state,icon,cls = "STRONG LONG","🟢","green"
+elif signed_signal <= -ENTRY_THRESHOLD:
+    state,icon,cls = "LONG","🔵","blue"
 else:
     state,icon,cls = "WAIT","🟡","yellow"
 
-# Gauge: normalized -10 = LONG, 0 = neutral, +10 = SHORT.
-pos = max(2, min(98, (directional_score+10)/20*100))
+# Gauge: -10 = LONG, 0 = neutral, +10 = SHORT.
+pos = max(2, min(98, (signed_signal+10)/20*100))
+if state == "WAIT":
+    lean = "SHORT" if signed_signal > 0 else ("LONG" if signed_signal < 0 else "NEUTRAL")
+    score_line = f"Signal Score <b>{signal_score:.1f}/10</b> · נטייה {lean}"
+else:
+    score_line = f"Signal Score <b>{signal_score:.1f}/10</b>"
+
 st.markdown(f"""
 <div class="signal">
   <div class="signal-title {cls}">{icon} {state}</div>
-  <div class="score">Directional Score <b>{directional_score:+.1f}</b></div>
-  <div class="metrics">
-    <div class="metric"><div class="metric-k">TRADE QUALITY</div><div class="metric-v">{trade_quality:.1f}/10</div></div>
-    <div class="metric"><div class="metric-k">AGREEMENT</div><div class="metric-v">{agreement_pct:.0f}%</div></div>
-  </div>
-  <div class="confidence">עסקה רק כשכיוון ≥ <b>5/10</b>, הסכמה ≥ <b>65%</b> ואיכות ≥ <b>5/10</b></div>
+  <div class="score">{score_line}</div>
+  <div class="confidence">כניסה לחיפוש עסקה רק מ־<b>5.0/10</b></div>
   <div class="gauge-wrap">
     <div class="pointer" style="left:{pos:.1f}%"></div>
     <div class="gauge"><div class="midline"></div></div>
-    <div class="gauge-labels"><span>LONG 10</span><span>NEUTRAL 0</span><span>SHORT 10</span></div>
-    <div class="gauge-zones"><span>LONG ≤ −5</span><span>WAIT</span><span>SHORT ≥ +5</span></div>
+    <div class="gauge-labels"><span>LONG 10</span><span>WAIT 0</span><span>SHORT 10</span></div>
+    <div class="gauge-zones"><span>כניסה מ־5</span><span>ללא עסקה</span><span>כניסה מ־5</span></div>
   </div>
 </div>
 """, unsafe_allow_html=True)
