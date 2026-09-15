@@ -56,8 +56,8 @@ h1,h2,h3{color:var(--txt)!important;}
 ''', unsafe_allow_html=True)
 
 @st.cache_data(ttl=300, show_spinner=False)
-def fetch_series(ticker, period="6mo"):
-    df = yf.download(ticker, period=period, interval="1d", auto_adjust=False, progress=False, threads=False)
+def fetch_series(ticker, period="6mo", interval="1d"):
+    df = yf.download(ticker, period=period, interval=interval, auto_adjust=False, progress=False, threads=False)
     if df is None or df.empty:
         return None
     if isinstance(df.columns, pd.MultiIndex):
@@ -77,14 +77,50 @@ def ema(s, n):
 def pctn(s, n):
     return float((s.iloc[-1] / s.iloc[-1-n] - 1) * 100) if s is not None and len(s) > n else np.nan
 
-def calc_rsi(s, n=14):
+def calc_rsi_series(s, n=14):
     d = s.diff()
     up = d.clip(lower=0)
     dn = -d.clip(upper=0)
     au = up.ewm(alpha=1/n, adjust=False).mean()
     ad = dn.ewm(alpha=1/n, adjust=False).mean()
     rs = au / ad.replace(0, np.nan)
-    return float((100 - 100/(1+rs)).iloc[-1])
+    return 100 - 100/(1+rs)
+
+def calc_rsi(s, n=14):
+    r = calc_rsi_series(s, n).dropna()
+    return float(r.iloc[-1]) if len(r) else np.nan
+
+def resample_close(s, hours):
+    if s is None or len(s) < 20:
+        return None
+    x = s.copy()
+    if not isinstance(x.index, pd.DatetimeIndex):
+        return None
+    try:
+        return x.resample(f"{hours}h").last().dropna()
+    except Exception:
+        return None
+
+def detect_rsi_divergence(s, lookback=45, pivot=2):
+    """Bullish: VIX lower low + RSI higher low. Bearish: VIX higher high + RSI lower high."""
+    if s is None or len(s) < 25:
+        return "none", "אין מספיק נתונים"
+    x = s.dropna().iloc[-lookback:]
+    r = calc_rsi_series(x, 14)
+    lows, highs = [], []
+    for i in range(pivot, len(x)-pivot):
+        win = x.iloc[i-pivot:i+pivot+1]
+        if x.iloc[i] == win.min(): lows.append(i)
+        if x.iloc[i] == win.max(): highs.append(i)
+    if len(lows) >= 2:
+        a,b = lows[-2],lows[-1]
+        if pd.notna(r.iloc[a]) and pd.notna(r.iloc[b]) and x.iloc[b] < x.iloc[a] and r.iloc[b] > r.iloc[a]:
+            return "bullish", f"VIX LL {x.iloc[a]:.1f}→{x.iloc[b]:.1f} | RSI HL {r.iloc[a]:.0f}→{r.iloc[b]:.0f}"
+    if len(highs) >= 2:
+        a,b = highs[-2],highs[-1]
+        if pd.notna(r.iloc[a]) and pd.notna(r.iloc[b]) and x.iloc[b] > x.iloc[a] and r.iloc[b] < r.iloc[a]:
+            return "bearish", f"VIX HH {x.iloc[a]:.1f}→{x.iloc[b]:.1f} | RSI LH {r.iloc[a]:.0f}→{r.iloc[b]:.0f}"
+    return "none", "אין Divergence מאושר כרגע"
 
 def badge(text, cls):
     return f'<span class="tag {cls}">{text}</span>'
@@ -100,6 +136,7 @@ market_ticker = "^NDX" if market_name == "Nasdaq 100" else "^GSPC"
 
 with st.spinner("טוען נתוני שוק..."):
     v = fetch_series("^VIX")
+    v_intra = fetch_series("^VIX", period="60d", interval="60m")
     v9 = fetch_series("^VIX9D")
     v3 = fetch_series("^VIX3M")
     vv = fetch_series("^VVIX")
@@ -115,6 +152,12 @@ VE5=ema(v,5); VE10=ema(v,10); VRSI=calc_rsi(v)
 C1=pctn(v,1); C5=pctn(v,5)
 M=float(m.iloc[-1]); ME5=ema(m,5); ME20=ema(m,20); M2=pctn(m,2); M5=pctn(m,5)
 R9=V9/V; R3=V/V3
+
+# RSI divergence on VIX — 4H and 12H, derived from hourly VIX observations.
+v4 = resample_close(v_intra, 4)
+v12 = resample_close(v_intra, 12)
+DIV4, DIV4_DETAIL = detect_rsi_divergence(v4, lookback=55, pivot=2)
+DIV12, DIV12_DETAIL = detect_rsi_divergence(v12, lookback=45, pivot=2)
 
 score=0.0
 reasons=[]
@@ -158,6 +201,20 @@ elif M5>=1.0: add(-0.6,"מומנטום 5 ימים חיובי")
 
 if VRSI>=60: add(0.35,"RSI VIX תומך בעלייה")
 elif VRSI<=40: add(-0.35,"RSI VIX תומך בירידה")
+
+# RSI Divergence: positive score = VIX likely up = equity SHORT bias.
+if DIV4 == "bullish": add(0.45,"Bullish RSI Divergence ב־VIX 4H → מחזק SHORT")
+elif DIV4 == "bearish": add(-0.45,"Bearish RSI Divergence ב־VIX 4H → מחזק LONG")
+else: reasons.append((0.0,"אין RSI Divergence מאושר ב־VIX 4H"))
+
+if DIV12 == "bullish": add(0.75,"Bullish RSI Divergence ב־VIX 12H → מחזק SHORT")
+elif DIV12 == "bearish": add(-0.75,"Bearish RSI Divergence ב־VIX 12H → מחזק LONG")
+else: reasons.append((0.0,"אין RSI Divergence מאושר ב־VIX 12H"))
+
+if DIV4 == DIV12 == "bullish":
+    add(0.35,"סנכרון Divergence שורי ב־4H+12H → בונוס SHORT")
+elif DIV4 == DIV12 == "bearish":
+    add(-0.35,"סנכרון Divergence דובי ב־4H+12H → בונוס LONG")
 
 if not np.isnan(VV):
     if VV>=115: add(0.55,"VVIX גבוה — אי־ודאות גבוהה")
@@ -232,6 +289,27 @@ with c8:
 with c9:
     metric_card("מומנטום המדד",f"2D {M2:+.2f}% · 5D {M5:+.2f}%","בודק אם המדד באמת נע באותו כיוון שה־VIX מרמז.","שלילי" if M5<0 else "חיובי","tag-red" if M5<0 else "tag-green")
 
+def div_ui(div):
+    if div == "bullish":
+        return "Bullish", "VIX עשוי לעלות → מחזק SHORT במדד", "tag-red"
+    if div == "bearish":
+        return "Bearish", "VIX עשוי לרדת → מחזק LONG במדד", "tag-green"
+    return "אין", "אין דיברג'נס מאושר כרגע", "tag-blue"
+
+d4_txt,d4_desc,d4_cls = div_ui(DIV4)
+d12_txt,d12_desc,d12_cls = div_ui(DIV12)
+sync = DIV4 == DIV12 and DIV4 in ("bullish","bearish")
+cs1,cs2,cs3=st.columns(3)
+with cs1:
+    metric_card("RSI Divergence · VIX 4H", d4_txt, DIV4_DETAIL, d4_desc, d4_cls)
+with cs2:
+    metric_card("RSI Divergence · VIX 12H", d12_txt, DIV12_DETAIL, d12_desc, d12_cls)
+with cs3:
+    sync_txt = "מסונכרן" if sync else ("סותר" if DIV4 != "none" and DIV12 != "none" and DIV4 != DIV12 else "ללא סנכרון")
+    sync_desc = "4H ו־12H באותו כיוון — מתקבל בונוס נוסף בציון." if sync else "אין כרגע בונוס סנכרון בין הטיימפריימים."
+    sync_bias = ("+0.35 SHORT" if DIV4 == "bullish" else "−0.35 LONG") if sync else "0.00"
+    metric_card("סנכרון Divergence", sync_txt, sync_desc, sync_bias, "tag-orange" if sync else "tag-blue")
+
 st.markdown('<div class="panel"><h3>🎯 מה חסר כדי לעלות שלב?</h3>', unsafe_allow_html=True)
 
 if "SHORT" in state:
@@ -240,7 +318,8 @@ if "SHORT" in state:
         ("VIX/VIX3M ≥ 0.98",R3>=0.98,f"כרגע {R3:.3f}"),
         (f"{market_name} מתחת EMA20",M<ME20,"כן" if M<ME20 else "לא"),
         ("מומנטום 2 ימים שלילי",M2<0,f"כרגע {M2:+.2f}%"),
-        ("VIX מעל EMA5",V>VE5,f"{V:.2f} מול {VE5:.2f}")
+        ("VIX מעל EMA5",V>VE5,f"{V:.2f} מול {VE5:.2f}"),
+        ("Divergence VIX תומך SHORT (4H/12H)",DIV4=="bullish" or DIV12=="bullish",f"4H {d4_txt} · 12H {d12_txt}")
     ]; goal="STRONG SHORT"
 elif "LONG" in state:
     tasks=[
@@ -248,7 +327,8 @@ elif "LONG" in state:
         ("VIX/VIX3M ≤ 0.96",R3<=0.96,f"כרגע {R3:.3f}"),
         (f"{market_name} מעל EMA20",M>ME20,"כן" if M>ME20 else "לא"),
         ("מומנטום 2 ימים חיובי",M2>0,f"כרגע {M2:+.2f}%"),
-        ("VIX מתחת EMA5",V<VE5,f"{V:.2f} מול {VE5:.2f}")
+        ("VIX מתחת EMA5",V<VE5,f"{V:.2f} מול {VE5:.2f}"),
+        ("Divergence VIX תומך LONG (4H/12H)",DIV4=="bearish" or DIV12=="bearish",f"4H {d4_txt} · 12H {d12_txt}")
     ]; goal="STRONG LONG"
 else:
     tasks=[
@@ -267,13 +347,21 @@ st.markdown('</div>', unsafe_allow_html=True)
 st.markdown('<div class="panel"><h3>💡 מה זה אומר בפועל?</h3>', unsafe_allow_html=True)
 if "SHORT" in state:
     st.write("יש לחץ עולה בשוק. עכשיו לא נכנסים בגלל ה־VIX בלבד — מחפשים ב־4H/1H שבירת תמיכה, Lower High או כישלון פריצה.")
-    st.write("אישור סופי: 1H ו־15m צריכים לתמוך בירידה.")
+    st.write("אישור סופי: גרף 1H צריך לתמוך בירידה.")
 elif "LONG" in state:
     st.write("הפחד נרגע והשוק מקבל סביבה תומכת יותר. מחפשים ב־4H/1H שמירת תמיכה, Higher Low או פריצה איכותית.")
-    st.write("אישור סופי: 1H ו־15m צריכים לתמוך בעלייה.")
+    st.write("אישור סופי: גרף 1H צריך לתמוך בעלייה.")
 else:
     st.write("אין כרגע יתרון ברור. המטרה היא לא להכריח עסקה — מחכים שה־VIX והמדד יסתנכרנו.")
 st.markdown('</div>', unsafe_allow_html=True)
+
+st.markdown('''<div class="panel"><h3>🧮 משקל ה־Divergence במשוואה</h3>
+<div class="small-muted">
+<b>4H:</b> Bullish +0.45 / Bearish −0.45 ·
+<b>12H:</b> Bullish +0.75 / Bearish −0.75 ·
+<b>אותו כיוון בשניהם:</b> בונוס נוסף +0.35 או −0.35.<br>
+ציון חיובי מחזק Risk-Off / SHORT במדד; ציון שלילי מחזק Risk-On / LONG במדד. Divergence הוא אישור — לא טריגר כניסה עצמאי.
+</div></div>''', unsafe_allow_html=True)
 
 with st.expander("📊 פירוט הציון"):
     for pts,txt in sorted(reasons,key=lambda x: abs(x[0]),reverse=True):
