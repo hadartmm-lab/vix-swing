@@ -50,7 +50,7 @@ html,body,[class*="css"]{background:var(--bg);color:var(--txt)}
 
 DATA_TIMEOUT = 8
 HTTP_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (VIX-Swing/10.3; Streamlit)",
+    "User-Agent": "Mozilla/5.0 (VIX-Swing/10.5; Streamlit)",
     "Accept": "application/json,text/csv,*/*",
 }
 
@@ -60,6 +60,9 @@ CBOE_SYMBOLS = {
     "^VIX9D": "VIX9D",
     "^VIX3M": "VIX3M",
     "^VVIX": "VVIX",
+    "^VIX1D": "VIX1D",
+    "^SKEW": "SKEW",
+    "^COR1M": "COR1M",
 }
 
 STOOQ_SYMBOLS = {
@@ -395,6 +398,75 @@ def resample_ohlc(df, hours):
     except Exception:
         return None
 
+def rolling_zscore_last(s, window=60):
+    if s is None:
+        return np.nan
+    x = pd.to_numeric(s, errors="coerce").dropna()
+    if len(x) < max(20, window // 2):
+        return np.nan
+    w = x.iloc[-window:]
+    sd = float(w.std(ddof=0))
+    if not np.isfinite(sd) or sd <= 1e-12:
+        return 0.0
+    return float((w.iloc[-1] - w.mean()) / sd)
+
+def aligned_ratio(a, b):
+    if a is None or b is None:
+        return None
+    aa = pd.to_numeric(a, errors="coerce").dropna()
+    bb = pd.to_numeric(b, errors="coerce").dropna()
+    # Normalize timezone differences so daily Cboe/Yahoo series can align reliably.
+    try:
+        aa.index = pd.to_datetime(aa.index).tz_localize(None).normalize()
+    except Exception:
+        try: aa.index = pd.to_datetime(aa.index).tz_convert(None).normalize()
+        except Exception: pass
+    try:
+        bb.index = pd.to_datetime(bb.index).tz_localize(None).normalize()
+    except Exception:
+        try: bb.index = pd.to_datetime(bb.index).tz_convert(None).normalize()
+        except Exception: pass
+    z = pd.concat([aa.rename("a"), bb.rename("b")], axis=1, join="inner").dropna()
+    if len(z) < 20:
+        return None
+    r = z["a"] / z["b"].replace(0, np.nan)
+    return r.replace([np.inf, -np.inf], np.nan).dropna()
+
+def swing_exhaustion_signal(s, lookback=45, pivot=2, recent_bars=7, min_swing_pct=0.8, rejection_pct=1.0):
+    """Detect recent VIX swing exhaustion, not trend continuation.
+
+    - New higher high that has already rejected lower can precede VIX fading -> Nasdaq LONG.
+    - New lower low that has already rebounded can precede VIX rising -> Nasdaq SHORT.
+    We deliberately require the rejection/rebound so a bare higher-high/lower-low is not
+    incorrectly treated as a reversal by itself.
+    """
+    if s is None or len(s) < 25:
+        return "none"
+    x = pd.to_numeric(s, errors="coerce").dropna().iloc[-lookback:]
+    if len(x) < 20:
+        return "none"
+    highs=[]; lows=[]
+    for i in range(pivot, len(x)-pivot):
+        w=x.iloc[i-pivot:i+pivot+1]
+        if x.iloc[i] == w.max() and (w == x.iloc[i]).sum() == 1: highs.append(i)
+        if x.iloc[i] == w.min() and (w == x.iloc[i]).sum() == 1: lows.append(i)
+    last=float(x.iloc[-1])
+    if len(highs)>=2:
+        a,b=highs[-2],highs[-1]
+        if len(x)-1-b <= recent_bars:
+            new_high=(x.iloc[b]/x.iloc[a]-1)*100
+            rejection=(last/x.iloc[b]-1)*100
+            if new_high >= min_swing_pct and rejection <= -rejection_pct:
+                return "higher_high_rejection"  # VIX downside / Nasdaq LONG
+    if len(lows)>=2:
+        a,b=lows[-2],lows[-1]
+        if len(x)-1-b <= recent_bars:
+            new_low=(x.iloc[b]/x.iloc[a]-1)*100
+            rebound=(last/x.iloc[b]-1)*100
+            if new_low <= -min_swing_pct and rebound >= rejection_pct:
+                return "lower_low_rebound"  # VIX upside / Nasdaq SHORT
+    return "none"
+
 def detect_divergence(s, lookback=45, pivot=2, min_sep=3, min_price_pct=0.7, min_rsi_delta=4.0, recent_bars=8):
     """Strict RSI divergence detector for VIX.
 
@@ -503,6 +575,11 @@ with st.spinner("מחשב..."):
     v9=fetch_close("^VIX9D",period="6mo")
     v3=fetch_close("^VIX3M",period="6mo")
     vv=fetch_close("^VVIX",period="6mo")
+    # Institutional / options-market layer. These are optional: the core model keeps
+    # running when one source is temporarily unavailable, and the UI reports coverage.
+    v1=fetch_close("^VIX1D",period="6mo")
+    skew=fetch_close("^SKEW",period="6mo")
+    cor1m=fetch_close("^COR1M",period="6mo")
     m=fetch_close(market_ticker,period="6mo")
     m_intra=fetch_close(market_ticker,period="60d",interval="60m")
     mo_intra=fetch_ohlc(market_ticker,period="60d",interval="60m")
@@ -522,6 +599,9 @@ if failed_daily:
     st.stop()
 
 V=float(v.iloc[-1]); V9=float(v9.iloc[-1]); V3=float(v3.iloc[-1]); VV=float(vv.iloc[-1]) if vv is not None and len(vv) else np.nan
+V1=float(v1.iloc[-1]) if v1 is not None and len(v1) else np.nan
+SKEW=float(skew.iloc[-1]) if skew is not None and len(skew) else np.nan
+COR1M=float(cor1m.iloc[-1]) if cor1m is not None and len(cor1m) else np.nan
 V12=resample_close(v_intra,12)
 M12=resample_close(m_intra,12)
 VO12=resample_ohlc(vo_intra,12)
@@ -543,72 +623,161 @@ if V12 is None or len(V12)<30 or VO12 is None or len(VO12)<20 or M12 is None or 
 V12_LAST=float(V12.iloc[-1])
 VE9,VE26,CROSS,CROSS_AGE,APPROACH,CROSS_NEAR,GAP=cross_status(V12)
 C1=pctn(v,1); C5=pctn(v,5); R9=V9/V; R3=V/V3
+R1=(V1/V) if np.isfinite(V1) and V>0 else np.nan
+R1_9=(V1/V9) if np.isfinite(V1) and V9>0 else np.nan
 M=float(m.iloc[-1]); M2=pctn(m,2); M5=pctn(m,5)
 DIV4=detect_divergence(resample_close(v_intra,4), lookback=60, pivot=3, min_sep=4, min_price_pct=0.75, min_rsi_delta=4.0, recent_bars=8)
 DIV12=detect_divergence(V12, lookback=50, pivot=2, min_sep=3, min_price_pct=1.0, min_rsi_delta=4.0, recent_bars=6)
+SWING12=swing_exhaustion_signal(V12, lookback=50, pivot=2, recent_bars=7, min_swing_pct=1.5, rejection_pct=1.5)
 SR, SUPPORT, RESISTANCE=support_resistance_signal(MO12,44,2)
 VIX_SR, VIX_SUPPORT, VIX_RESISTANCE=support_resistance_signal(VO12,44,2)
 
+# Institutional pressure metrics. Use relative/z-score logic rather than fixed raw levels
+# so the model adapts across calm and stressed volatility regimes.
+VV5=pctn(vv,5) if vv is not None else np.nan
+VV_RATIO=aligned_ratio(vv,v)
+VV_Z=rolling_zscore_last(VV_RATIO,60) if VV_RATIO is not None else np.nan
+VV_REL=(VV5-C5) if np.isfinite(VV5) and np.isfinite(C5) else np.nan
+SKEW5=pctn(skew,5) if skew is not None else np.nan
+SKEW_Z=rolling_zscore_last(skew,60) if skew is not None else np.nan
+COR5=pctn(cor1m,5) if cor1m is not None else np.nan
+COR_Z=rolling_zscore_last(cor1m,60) if cor1m is not None else np.nan
+
 score=0.0; reasons=[]
-def add(p,t):
+category_scores={
+    "VIX Reversal":0.0,
+    "Institutional":0.0,
+    "Vol Curve":0.0,
+    "Market Confirmation":0.0,
+    "EMA":0.0,
+}
+
+def addcat(cat,p,t):
     global score
-    score+=p; reasons.append((p,t))
+    p=float(p)
+    category_scores[cat]+=p
+    score+=p
+    reasons.append((p,t,cat))
 
-# VIX EMA structure
-add(1.2 if V12_LAST>VE9 else -1.2, "VIX 12H מעל EMA9" if V12_LAST>VE9 else "VIX 12H מתחת EMA9")
-add(1.0 if VE9>VE26 else -1.0, "EMA9 מעל EMA26" if VE9>VE26 else "EMA9 מתחת EMA26")
-if CROSS=="golden" and CROSS_AGE is not None and CROSS_AGE<=5: add(0.6,"Golden Cross טרי ב-VIX")
-elif CROSS=="death" and CROSS_AGE is not None and CROSS_AGE<=5: add(-0.6,"Death Cross טרי ב-VIX")
+# -----------------------------------------------------------------------------
+# 1) VIX REVERSAL / STRUCTURE — ~45% of total model weight
+# Divergence is intentionally the dominant signal. Higher-high/lower-low swing
+# structure is scored only after rejection/rebound confirmation, never by itself.
+# -----------------------------------------------------------------------------
+if DIV12=="bullish": addcat("VIX Reversal", 1.90,"VIX 12H Bullish RSI Divergence → VIX UP / Nasdaq SHORT")
+elif DIV12=="bearish": addcat("VIX Reversal",-1.90,"VIX 12H Bearish RSI Divergence → VIX DOWN / Nasdaq LONG")
 
-# Short-volatility structure
-if R9>=1.03: add(1.4,"VIX9D בפרמיה")
-elif R9<=0.97: add(-1.0,"VIX9D נמוך מ-VIX")
-if C1>=8: add(1.4,"VIX זינק ≥8% ביום")
-elif C1>=3: add(0.7,"VIX עלה ≥3% ביום")
-elif C1<=-8: add(-1.4,"VIX ירד ≥8% ביום")
-elif C1<=-3: add(-0.7,"VIX ירד ≥3% ביום")
-if C5>=10: add(1.2,"VIX עלה ≥10% ב-5 ימים")
-elif C5>=4: add(0.7,"VIX עלה ≥4% ב-5 ימים")
-elif C5<=-10: add(-1.2,"VIX ירד ≥10% ב-5 ימים")
-elif C5<=-4: add(-0.7,"VIX ירד ≥4% ב-5 ימים")
+if DIV4=="bullish": addcat("VIX Reversal", 1.00,"VIX 4H Bullish RSI Divergence → SHORT")
+elif DIV4=="bearish": addcat("VIX Reversal",-1.00,"VIX 4H Bearish RSI Divergence → LONG")
 
-# Term structure
-if R3>=1.02: add(1.35,"Backwardation / לחץ")
-elif R3<=0.94: add(-1.35,"Contango / רגיעה")
+if DIV4==DIV12=="bullish": addcat("VIX Reversal", 0.45,"סנכרון Divergence 4H+12H → SHORT")
+elif DIV4==DIV12=="bearish": addcat("VIX Reversal",-0.45,"סנכרון Divergence 4H+12H → LONG")
 
-# Nasdaq / S&P: no moving-average score; only short momentum and 12H support/resistance
-if M2<=-0.5: add(1.0,"מומנטום 2D שלילי")
-elif M2>=0.5: add(-1.0,"מומנטום 2D חיובי")
-if M5<=-1.0: add(0.6,"מומנטום 5D שלילי")
-elif M5>=1.0: add(-0.6,"מומנטום 5D חיובי")
+if SWING12=="higher_high_rejection":
+    addcat("VIX Reversal",-0.65,"VIX יצר שיא עולה ודחה מטה → פוטנציאל ירידת VIX / LONG")
+elif SWING12=="lower_low_rebound":
+    addcat("VIX Reversal", 0.30,"VIX יצר שפל יורד וחזר מעלה → פוטנציאל עליית VIX / SHORT")
 
-# RSI is NOT scored directly; only divergence is scored.
-if DIV4=="bullish": add(0.45,"Bullish RSI Divergence ב-VIX 4H")
-elif DIV4=="bearish": add(-0.45,"Bearish RSI Divergence ב-VIX 4H")
-if DIV12=="bullish": add(0.75,"Bullish RSI Divergence ב-VIX 12H")
-elif DIV12=="bearish": add(-0.75,"Bearish RSI Divergence ב-VIX 12H")
-if DIV4==DIV12=="bullish": add(0.35,"סנכרון Divergence ל-SHORT")
-elif DIV4==DIV12=="bearish": add(-0.35,"סנכרון Divergence ל-LONG")
+# VIX S/R is supportive, but deliberately smaller than divergence.
+if VIX_SR=="bounce_support": addcat("VIX Reversal", 0.40,"VIX 12H תגובה מתמיכה → SHORT")
+elif VIX_SR=="reject_resistance": addcat("VIX Reversal",-0.40,"VIX 12H דחייה מהתנגדות → LONG")
+elif VIX_SR=="breakout": addcat("VIX Reversal", 0.50,"VIX 12H פריצה מעל התנגדות → SHORT")
+elif VIX_SR=="breakdown": addcat("VIX Reversal",-0.50,"VIX 12H שבירה מתחת לתמיכה → LONG")
 
-# Support / resistance from about one month of 12H market structure
-# Market index logic: resistance rejection supports SHORT; support bounce supports LONG.
-if SR=="reject_resistance": add(0.5,f"{market_name}: דחייה מהתנגדות 12H")
-elif SR=="breakout": add(-0.6,f"{market_name}: פריצה מעל התנגדות 12H")
-elif SR=="bounce_support": add(-0.5,f"{market_name}: תגובה מתמיכה 12H")
-elif SR=="breakdown": add(0.6,f"{market_name}: שבירה מתחת לתמיכה 12H")
+# -----------------------------------------------------------------------------
+# 2) INSTITUTIONAL VOLATILITY PRESSURE — 25%
+# Approximation of professional options-desk pressure using public Cboe indices:
+# VVIX relative pressure, VIX1D short-end curve, SKEW tail demand, COR1M correlation.
+# Every component is optional; missing data is shown as reduced coverage, not guessed.
+# -----------------------------------------------------------------------------
+institutional_available=0.0
+institutional_total=2.5
 
-# NEW: VIX 12H support / resistance is inverse to the equity index.
-# VIX near/support bounce = possible VIX rise -> QQQ/Nasdaq SHORT.
-# VIX near/resistance rejection = possible VIX fade -> QQQ/Nasdaq LONG.
-if VIX_SR=="bounce_support": add(0.55,"VIX 12H ליד תמיכה / תגובה מתמיכה → SHORT")
-elif VIX_SR=="reject_resistance": add(-0.55,"VIX 12H ליד התנגדות / דחייה → LONG")
-elif VIX_SR=="breakout": add(0.70,"VIX 12H פריצה מאושרת מעל התנגדות → SHORT")
-elif VIX_SR=="breakdown": add(-0.70,"VIX 12H שבירה מאושרת מתחת לתמיכה → LONG")
+if vv is not None and len(vv)>=30 and np.isfinite(VV_Z) and np.isfinite(VV_REL):
+    institutional_available += 0.9
+    if VV_Z>=1.0 and VV_REL>=4.0:
+        addcat("Institutional", 0.90,"VVIX מוביל את VIX משמעותית → Hidden Vol Pressure / SHORT")
+    elif VV_Z>=0.5 and VV_REL>=2.0:
+        addcat("Institutional", 0.55,"VVIX מתחזק יחסית ל-VIX → לחץ סמוי / SHORT")
+    elif VV_Z<=-1.0 and VV_REL<=-4.0:
+        addcat("Institutional",-0.90,"VVIX נחלש משמעותית מול VIX → Vol Relief / LONG")
+    elif VV_Z<=-0.5 and VV_REL<=-2.0:
+        addcat("Institutional",-0.55,"VVIX נחלש יחסית ל-VIX → רגיעה / LONG")
 
-# Modest VIX level adjustment
-if V>=30: add(0.5,"VIX ≥30")
-elif V>=25: add(0.25,"VIX ≥25")
-elif V<15: add(-0.2,"VIX <15")
+if v1 is not None and len(v1)>=20 and np.isfinite(R1) and np.isfinite(R1_9):
+    institutional_available += 0.8
+    if R1_9>=1.05 and R9>=1.02:
+        addcat("Institutional", 0.80,"VIX1D > VIX9D > VIX → לחץ בקצה הקצר / SHORT")
+    elif R1>=1.10:
+        addcat("Institutional", 0.55,"VIX1D בפרמיה חדה ל-VIX → Event Risk / SHORT")
+    elif R1_9<=0.90 and R9<=0.98:
+        addcat("Institutional",-0.80,"VIX1D < VIX9D < VIX → רגיעה בקצה הקצר / LONG")
+    elif R1<=0.85 and R9<=1.00:
+        addcat("Institutional",-0.40,"VIX1D נמוך משמעותית מ-VIX → לחץ מיידי נמוך / LONG")
+
+if skew is not None and len(skew)>=30 and np.isfinite(SKEW_Z) and np.isfinite(SKEW5):
+    institutional_available += 0.4
+    if SKEW_Z>=0.75 and SKEW5>=2.0:
+        addcat("Institutional", 0.40,"SKEW עולה ומעל הנורמה → ביקוש Tail Risk / SHORT")
+    elif SKEW_Z<=-0.75 and SKEW5<=-2.0:
+        addcat("Institutional",-0.40,"SKEW נחלש ומתחת לנורמה → ירידת Tail Demand / LONG")
+
+if cor1m is not None and len(cor1m)>=30 and np.isfinite(COR_Z) and np.isfinite(COR5):
+    institutional_available += 0.4
+    if COR_Z>=0.50 and COR5>=3.0:
+        addcat("Institutional", 0.40,"COR1M עולה → סיכון מערכתי / Herding / SHORT")
+    elif COR_Z<=-0.50 and COR5<=-3.0:
+        addcat("Institutional",-0.40,"COR1M יורד → פיזור סיכון משתפר / LONG")
+
+# -----------------------------------------------------------------------------
+# 3) VOL CURVE / VIX IMPULSE — 15%
+# Existing VIX9D/VIX and VIX/VIX3M remain important but are no longer allowed to
+# overwhelm reversal structure. Daily/5D VIX moves are compressed into one impulse.
+# -----------------------------------------------------------------------------
+if R9>=1.03: addcat("Vol Curve", 0.50,"VIX9D בפרמיה ל-VIX → לחץ קצר טווח")
+elif R9<=0.97: addcat("Vol Curve",-0.50,"VIX9D מתחת ל-VIX → רגיעה קצרה")
+
+if R3>=1.02: addcat("Vol Curve", 0.50,"VIX/VIX3M Backwardation → Risk-Off")
+elif R3<=0.94: addcat("Vol Curve",-0.50,"VIX/VIX3M Contango → Risk-On")
+
+if C1>=8 or C5>=10: addcat("Vol Curve", 0.40,"VIX impulse חזק מעלה")
+elif C1>=3 or C5>=4: addcat("Vol Curve", 0.25,"VIX impulse מעלה")
+elif C1<=-8 or C5<=-10: addcat("Vol Curve",-0.40,"VIX impulse חזק מטה")
+elif C1<=-3 or C5<=-4: addcat("Vol Curve",-0.25,"VIX impulse מטה")
+
+if V>=30: addcat("Vol Curve", 0.10,"VIX ≥30")
+elif V<15: addcat("Vol Curve",-0.10,"VIX <15")
+
+# -----------------------------------------------------------------------------
+# 4) MARKET CONFIRMATION — 10%
+# Nasdaq/S&P confirms the volatility read; it does not lead the VIX model.
+# -----------------------------------------------------------------------------
+if M2<=-0.5: addcat("Market Confirmation", 0.15,f"{market_name} מומנטום 2D שלילי")
+elif M2>=0.5: addcat("Market Confirmation",-0.15,f"{market_name} מומנטום 2D חיובי")
+
+if M5<=-1.0: addcat("Market Confirmation", 0.05,f"{market_name} מומנטום 5D שלילי")
+elif M5>=1.0: addcat("Market Confirmation",-0.05,f"{market_name} מומנטום 5D חיובי")
+
+if SR=="reject_resistance": addcat("Market Confirmation", 0.80,f"{market_name}: דחייה מהתנגדות 12H")
+elif SR=="breakout": addcat("Market Confirmation",-0.80,f"{market_name}: פריצה מעל התנגדות 12H")
+elif SR=="bounce_support": addcat("Market Confirmation",-0.80,f"{market_name}: תגובה מתמיכה 12H")
+elif SR=="breakdown": addcat("Market Confirmation", 0.80,f"{market_name}: שבירה מתחת לתמיכה 12H")
+
+# -----------------------------------------------------------------------------
+# 5) EMA 9/26 — only 5%
+# Kept as a small trend filter per design request; never a dominant signal.
+# -----------------------------------------------------------------------------
+addcat("EMA", 0.15 if V12_LAST>VE9 else -0.15,
+       "VIX 12H מעל EMA9" if V12_LAST>VE9 else "VIX 12H מתחת EMA9")
+addcat("EMA", 0.20 if VE9>VE26 else -0.20,
+       "EMA9 מעל EMA26" if VE9>VE26 else "EMA9 מתחת EMA26")
+if CROSS=="golden" and CROSS_AGE is not None and CROSS_AGE<=5:
+    addcat("EMA", 0.15,"Golden Cross טרי ב-VIX")
+elif CROSS=="death" and CROSS_AGE is not None and CROSS_AGE<=5:
+    addcat("EMA",-0.15,"Death Cross טרי ב-VIX")
+
+# Public-source data coverage. Core model = 75%; institutional layer = 25%.
+data_coverage = 75.0 + 25.0 * (institutional_available / institutional_total)
 
 # One clear signal score
 # The internal weighted score and the visible scale now use the SAME units.
@@ -648,7 +817,7 @@ st.markdown(f"""
 <div class="signal">
   <div class="signal-title {cls}">{icon} {state}</div>
   <div class="score">{score_line}</div>
-  <div class="confidence">כניסה לחיפוש עסקה רק מ־<b>5.0/10</b></div>
+  <div class="confidence">כניסה לחיפוש עסקה רק מ־<b>5.0/10</b> · כיסוי נתונים <b>{data_coverage:.0f}%</b></div>
   <div class="gauge-wrap">
     <div class="pointer" style="left:{pos:.1f}%"></div>
     <div class="gauge"><div class="midline"></div></div>
@@ -661,7 +830,7 @@ st.markdown(f"""
 # Top drivers
 top_drivers = sorted(reasons, key=lambda z: abs(z[0]), reverse=True)[:3]
 driver_rows = []
-for pts, txt in top_drivers:
+for pts, txt, cat in top_drivers:
     badge_cls = "red" if pts > 0 else ("green" if pts < 0 else "white")
     badge_label = f"{pts:+.2f}"
     driver_rows.append(
@@ -709,19 +878,34 @@ def vix_sr_text(s):
         "neutral":("ניטרלי","white")
     }[s]
 
+def swing_text(s):
+    return {
+        "higher_high_rejection":("שיא עולה + דחייה → LONG","green"),
+        "lower_low_rebound":("שפל יורד + חזרה → SHORT","red"),
+        "none":("אין אישור","white")
+    }.get(s,("אין אישור","white"))
+
+def institutional_text(v):
+    if v>=0.45: return f"Pressure {v:+.2f}/2.5 → SHORT","red"
+    if v<=-0.45: return f"Relief {v:+.2f}/2.5 → LONG","green"
+    return f"Neutral {v:+.2f}/2.5","white"
+
 d4,d4c=div_text(DIV4); d12,d12c=div_text(DIV12); srt,src=sr_text(SR); vsrt,vsrc=vix_sr_text(VIX_SR)
+swingt,swingc=swing_text(SWING12); instt,instc=institutional_text(category_scores["Institutional"])
 term_text="Risk-Off" if R3>=1.02 else ("Risk-On" if R3<=0.94 else "ניטרלי")
 term_cls="red" if R3>=1.02 else ("green" if R3<=0.94 else "white")
 
 st.markdown('<div class="status-grid">'+
-    status_row("VIX · EMA9/26 · 12H",ema_bias,ema_cls)+
-    status_row("Cross · EMA9/26 · 12H",cross_text,cross_cls)+
+    status_row("Divergence 12H · HIGH WEIGHT",d12,d12c)+
     status_row("Divergence 4H",d4,d4c)+
-    status_row("Divergence 12H",d12,d12c)+
-    status_row(f"{market_name} S/R · 12H",srt,src)+
+    status_row("VIX Swing Structure · 12H",swingt,swingc)+
+    status_row("Institutional Vol Pressure",instt,instc)+
     status_row("VIX S/R · 12H",vsrt,vsrc)+
+    status_row(f"{market_name} S/R · 12H",srt,src)+
     status_row("Term Structure",term_text,term_cls)+
     status_row("VIX9D / VIX",("לחץ" if R9>=1.03 else ("רגוע" if R9<=0.97 else "מאוזן")),"red" if R9>=1.03 else ("green" if R9<=0.97 else "white"))+
+    status_row("EMA9/26 · 12H · LOW WEIGHT",ema_bias,ema_cls)+
+    status_row("Cross · EMA9/26",cross_text,cross_cls)+
     '</div>',unsafe_allow_html=True)
 
 # Minimal execution reminder
@@ -731,23 +915,40 @@ else: action="אין עסקה — המתן לסנכרון"
 st.markdown(f'<div class="panel" style="text-align:center;font-weight:900">{action}</div>',unsafe_allow_html=True)
 
 with st.expander("פירוט החישוב"):
+    st.write("**משקלי המודל:** VIX Divergence/Structure 45% · Institutional Vol 25% · Vol Curve 15% · Market Confirmation 10% · EMA9/26 5%")
+    st.caption("כיול סופי: מומנטום Nasdaq הונמך לאחר בק־טסט; Higher High + rejection ב־VIX קיבל משקל גדול יותר מ־Lower Low + rebound; Swing דורש כעת תנועה ואישור של 1.5% לפחות.")
     st.write(f"VIX 12H {V12_LAST:.2f} · EMA9 {VE9:.2f} · EMA26 {VE26:.2f} · Cross proximity {CROSS_NEAR}/10")
+    st.write(f"Divergence: 4H={DIV4} · 12H={DIV12} · Swing 12H={SWING12}")
     st.write(f"VIX 1D {C1:+.2f}% · 5D {C5:+.2f}% · VIX9D/VIX {R9:.3f} · VIX/VIX3M {R3:.3f}")
-    st.write(f"{market_name}: ללא EMA בציון · מומנטום 2D {M2:+.2f}% · 5D {M5:+.2f}% · S/R 12H: {SR} · תמיכה {SUPPORT:.2f} · התנגדות {RESISTANCE:.2f}")
-    st.write(f"VIX S/R 12H: {VIX_SR} · תמיכה {VIX_SUPPORT:.2f} · התנגדות {VIX_RESISTANCE:.2f} · משקל: ±0.55 ליד רמה, ±0.70 בפריצה/שבירה")
-    st.write("RSI של VIX אינו מקבל ניקוד ישיר; הוא משמש רק לזיהוי Divergence מאומת ב-4H/12H עם סינון רעש מחמיר.")
+    if np.isfinite(V1):
+        st.write(f"VIX1D {V1:.2f} · VIX1D/VIX {R1:.3f} · VIX1D/VIX9D {R1_9:.3f}")
+    if np.isfinite(VV):
+        st.write(f"VVIX {VV:.2f} · VVIX/VIX z-score {VV_Z:+.2f} · Relative 5D momentum {VV_REL:+.2f}pp")
+    if np.isfinite(SKEW):
+        st.write(f"SKEW {SKEW:.2f} · 5D {SKEW5:+.2f}% · z-score {SKEW_Z:+.2f}")
+    if np.isfinite(COR1M):
+        st.write(f"COR1M {COR1M:.2f} · 5D {COR5:+.2f}% · z-score {COR_Z:+.2f}")
+    st.write(f"{market_name}: מומנטום 2D {M2:+.2f}% · 5D {M5:+.2f}% · S/R 12H: {SR} · תמיכה {SUPPORT:.2f} · התנגדות {RESISTANCE:.2f}")
+    st.write(f"VIX S/R 12H: {VIX_SR} · תמיכה {VIX_SUPPORT:.2f} · התנגדות {VIX_RESISTANCE:.2f}")
+    st.write(f"כיסוי נתונים: {data_coverage:.0f}% · Institutional availability {institutional_available:.1f}/{institutional_total:.1f}")
+    st.write("RSI עצמו אינו מקבל נקודות. רק Divergence מאומת מקבל משקל, כדי להימנע מ-RSI overbought/oversold פשוט שעלול להטעות ב-VIX.")
     st.write(f"ציון משוקלל נטו: {score:+.2f} → Signal Score {signal_score:.2f}/10 · כיוון: {'SHORT' if signed_signal>0 else ('LONG' if signed_signal<0 else 'NEUTRAL')}")
-    for pts,txt in sorted(reasons,key=lambda z:abs(z[0]),reverse=True):
-        st.write(f"**{pts:+.2f}** — {txt}")
+    st.write("**ציוני קטגוריות:** " + " · ".join([f"{k}: {v:+.2f}" for k,v in category_scores.items()]))
+    for pts,txt,cat in sorted(reasons,key=lambda z:abs(z[0]),reverse=True):
+        st.write(f"**{pts:+.2f}** — {txt}  ·  _{cat}_")
 
 with st.expander("מקורות נתונים / גיבוי"):
     st.write(f"VIX Daily: **{source_name(v)}**")
     st.write(f"VIX9D Daily: **{source_name(v9)}**")
     st.write(f"VIX3M Daily: **{source_name(v3)}**")
+    st.write(f"VVIX Daily: **{source_name(vv)}**")
+    st.write(f"VIX1D Daily: **{source_name(v1)}**")
+    st.write(f"SKEW Daily: **{source_name(skew)}**")
+    st.write(f"COR1M Daily: **{source_name(cor1m)}**")
     st.write(f"{market_name} Daily: **{source_name(m)}**")
     st.write(f"VIX Close 60m: **{source_name(v_intra)}**")
     st.write(f"VIX OHLC 60m: **{source_name(vo_intra)}**")
     st.write(f"{market_name} 60m: **{source_name(m_intra)}**")
-    st.caption("סדר הגיבוי: Yahoo/yfinance → Yahoo Chart API ישיר. לנתוני Daily בלבד: Cboe הרשמי למדדי VIX, ו-Stooq למדדי NDX/SPX.")
+    st.caption("גיבוי אמיתי: Yahoo/yfinance → Yahoo Chart API ישיר → Cboe הרשמי למדדי תנודתיות/אופציות. FRED משמש ל-VIX/VIX3M במידת הצורך, ו-Stooq למדדי NDX/SPX. רכיב Institutional הוא אופציונלי: מקור חסר מוריד Data Coverage ואינו מוחלף בנתון מומצא.")
 
-st.caption(f"עודכן {datetime.now().strftime('%H:%M')} · מנגנון Multi-Source + Retry פעיל · כלי מחקרי, לא ייעוץ השקעות")
+st.caption(f"עודכן {datetime.now().strftime('%H:%M')} · v10.5 Final Calibrated · Multi-Source + Retry פעיל · כלי מחקרי, לא ייעוץ השקעות")
