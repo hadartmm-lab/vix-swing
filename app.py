@@ -34,6 +34,15 @@ html,body,[class*="css"]{background:var(--bg);color:var(--txt)}
 .green{color:#72e8a7}.red{color:#ff8c92}.orange{color:#ffc06d}.blue{color:#82c9ff}.yellow{color:#ffe47b}.white{color:#fff}
 .panel{background:#0b1f31;border:1px solid var(--line);border-radius:18px;padding:14px;margin-top:11px;color:#ffffff}
 .panel, .panel *{color:#ffffff!important}
+.drivers-card{background:linear-gradient(180deg,#0b1f31 0%,#0a1b2b 100%);border:1px solid var(--line);border-radius:18px;padding:14px 14px 10px;margin:10px 0 12px;box-shadow:0 8px 24px rgba(0,0,0,.14)}
+.drivers-title{font-size:1.02rem;font-weight:950;color:#ffffff;margin-bottom:10px}
+.driver-row{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:9px 0;border-top:1px solid rgba(255,255,255,.07)}
+.driver-row:first-of-type{border-top:none;padding-top:0}
+.driver-text{font-size:.92rem;font-weight:800;color:#eef5fa;line-height:1.35;flex:1}
+.driver-badge{font-size:.84rem;font-weight:950;padding:4px 10px;border-radius:999px;border:1px solid rgba(255,255,255,.16);white-space:nowrap;background:rgba(255,255,255,.04)}
+.driver-badge.red{background:rgba(255,140,146,.10);border-color:rgba(255,140,146,.35)}
+.driver-badge.green{background:rgba(114,232,167,.10);border-color:rgba(114,232,167,.35)}
+.driver-badge.white{background:rgba(255,255,255,.06);border-color:rgba(255,255,255,.15)}
 .stButton>button{width:100%;border-radius:14px;border:1px solid #1f6fa0;background:#0c2d46;color:white;font-weight:850;padding:.65rem 1rem}
 [data-testid="stMarkdownContainer"] p,[data-testid="stMarkdownContainer"] li,[data-testid="stRadio"] label,[data-testid="stWidgetLabel"] p,[data-testid="stCaptionContainer"] p,[data-testid="stExpander"] summary,[data-testid="stExpander"] summary p{color:#f3f7fb!important}
 </style>
@@ -648,6 +657,21 @@ st.markdown(f"""
   </div>
 </div>
 """, unsafe_allow_html=True)
+
+# Top drivers
+top_drivers = sorted(reasons, key=lambda z: abs(z[0]), reverse=True)[:3]
+driver_rows = []
+for pts, txt in top_drivers:
+    badge_cls = "red" if pts > 0 else ("green" if pts < 0 else "white")
+    badge_label = f"{pts:+.2f}"
+    driver_rows.append(
+        f'<div class="driver-row"><div class="driver-text">{txt}</div><div class="driver-badge {badge_cls}">{badge_label}</div></div>'
+    )
+if driver_rows:
+    st.markdown(
+        '<div class="drivers-card"><div class="drivers-title">Top Drivers</div>' + ''.join(driver_rows) + '</div>',
+        unsafe_allow_html=True
+    )
 
 # Compact statuses
 ema_bias="SHORT" if VE9>VE26 else "LONG"
