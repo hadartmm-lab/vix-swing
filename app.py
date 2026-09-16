@@ -41,7 +41,7 @@ html,body,[class*="css"]{background:var(--bg);color:var(--txt)}
 
 DATA_TIMEOUT = 8
 HTTP_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (VIX-Swing/10.1; Streamlit)",
+    "User-Agent": "Mozilla/5.0 (VIX-Swing/10.3; Streamlit)",
     "Accept": "application/json,text/csv,*/*",
 }
 
@@ -490,6 +490,7 @@ market_ticker="^NDX" if market_name=="Nasdaq 100" else "^GSPC"
 with st.spinner("מחשב..."):
     v=fetch_close("^VIX",period="6mo")
     v_intra=fetch_close("^VIX",period="60d",interval="60m")
+    vo_intra=fetch_ohlc("^VIX",period="60d",interval="60m")
     v9=fetch_close("^VIX9D",period="6mo")
     v3=fetch_close("^VIX3M",period="6mo")
     vv=fetch_close("^VVIX",period="6mo")
@@ -514,15 +515,18 @@ if failed_daily:
 V=float(v.iloc[-1]); V9=float(v9.iloc[-1]); V3=float(v3.iloc[-1]); VV=float(vv.iloc[-1]) if vv is not None and len(vv) else np.nan
 V12=resample_close(v_intra,12)
 M12=resample_close(m_intra,12)
+VO12=resample_ohlc(vo_intra,12)
 MO12=resample_ohlc(mo_intra,12)
-if V12 is None or len(V12)<30 or M12 is None or len(M12)<20 or MO12 is None or len(MO12)<20:
+if V12 is None or len(V12)<30 or VO12 is None or len(VO12)<20 or M12 is None or len(M12)<20 or MO12 is None or len(MO12)<20:
     failed_intraday=[]
-    if V12 is None or len(V12)<30: failed_intraday.append("VIX 60m → 12H")
+    if V12 is None or len(V12)<30: failed_intraday.append("VIX Close 60m → 12H")
+    if VO12 is None or len(VO12)<20: failed_intraday.append("VIX OHLC 60m → 12H")
     if M12 is None or len(M12)<20: failed_intraday.append(f"{market_name} 60m → 12H")
     if MO12 is None or len(MO12)<20: failed_intraday.append(f"{market_name} OHLC 60m → 12H")
     st.error("לא הצלחתי לבנות נתוני 12H עבור: " + ", ".join(failed_intraday) + ". בוצעו ניסיונות חוזרים דרך yfinance וגם דרך Yahoo Chart API ישיר.")
     with st.expander("אבחון מקורות נתונים"):
-        st.write(f"VIX 60m: {source_name(v_intra)} · {len(v_intra) if v_intra is not None else 0} נקודות")
+        st.write(f"VIX Close 60m: {source_name(v_intra)} · {len(v_intra) if v_intra is not None else 0} נקודות")
+        st.write(f"VIX OHLC 60m: {source_name(vo_intra)} · {len(vo_intra) if vo_intra is not None else 0} נקודות")
         st.write(f"{market_name} 60m: {source_name(m_intra)} · {len(m_intra) if m_intra is not None else 0} נקודות")
         st.write(f"{market_name} OHLC 60m: {source_name(mo_intra)} · {len(mo_intra) if mo_intra is not None else 0} נקודות")
         st.caption("נתוני 12H הם חלק קריטי מהשיטה, לכן האפליקציה לא מחליפה אותם בנתוני Daily שעלולים לשנות את האות.")
@@ -534,6 +538,7 @@ M=float(m.iloc[-1]); M2=pctn(m,2); M5=pctn(m,5)
 DIV4=detect_divergence(resample_close(v_intra,4), lookback=60, pivot=3, min_sep=4, min_price_pct=0.75, min_rsi_delta=4.0, recent_bars=8)
 DIV12=detect_divergence(V12, lookback=50, pivot=2, min_sep=3, min_price_pct=1.0, min_rsi_delta=4.0, recent_bars=6)
 SR, SUPPORT, RESISTANCE=support_resistance_signal(MO12,44,2)
+VIX_SR, VIX_SUPPORT, VIX_RESISTANCE=support_resistance_signal(VO12,44,2)
 
 score=0.0; reasons=[]
 def add(p,t):
@@ -577,10 +582,19 @@ if DIV4==DIV12=="bullish": add(0.35,"סנכרון Divergence ל-SHORT")
 elif DIV4==DIV12=="bearish": add(-0.35,"סנכרון Divergence ל-LONG")
 
 # Support / resistance from about one month of 12H market structure
-if SR=="reject_resistance": add(0.5,"דחייה מהתנגדות")
-elif SR=="breakout": add(-0.6,"פריצה מעל התנגדות")
-elif SR=="bounce_support": add(-0.5,"תגובה מתמיכה")
-elif SR=="breakdown": add(0.6,"שבירה מתחת לתמיכה")
+# Market index logic: resistance rejection supports SHORT; support bounce supports LONG.
+if SR=="reject_resistance": add(0.5,f"{market_name}: דחייה מהתנגדות 12H")
+elif SR=="breakout": add(-0.6,f"{market_name}: פריצה מעל התנגדות 12H")
+elif SR=="bounce_support": add(-0.5,f"{market_name}: תגובה מתמיכה 12H")
+elif SR=="breakdown": add(0.6,f"{market_name}: שבירה מתחת לתמיכה 12H")
+
+# NEW: VIX 12H support / resistance is inverse to the equity index.
+# VIX near/support bounce = possible VIX rise -> QQQ/Nasdaq SHORT.
+# VIX near/resistance rejection = possible VIX fade -> QQQ/Nasdaq LONG.
+if VIX_SR=="bounce_support": add(0.55,"VIX 12H ליד תמיכה / תגובה מתמיכה → SHORT")
+elif VIX_SR=="reject_resistance": add(-0.55,"VIX 12H ליד התנגדות / דחייה → LONG")
+elif VIX_SR=="breakout": add(0.70,"VIX 12H פריצה מאושרת מעל התנגדות → SHORT")
+elif VIX_SR=="breakdown": add(-0.70,"VIX 12H שבירה מאושרת מתחת לתמיכה → LONG")
 
 # Modest VIX level adjustment
 if V>=30: add(0.5,"VIX ≥30")
@@ -662,7 +676,16 @@ def sr_text(s):
         "neutral":("ניטרלי","white")
     }[s]
 
-d4,d4c=div_text(DIV4); d12,d12c=div_text(DIV12); srt,src=sr_text(SR)
+def vix_sr_text(s):
+    return {
+        "reject_resistance":("התנגדות → LONG","green"),
+        "breakout":("Breakout → SHORT","red"),
+        "bounce_support":("תמיכה → SHORT","red"),
+        "breakdown":("Breakdown → LONG","green"),
+        "neutral":("ניטרלי","white")
+    }[s]
+
+d4,d4c=div_text(DIV4); d12,d12c=div_text(DIV12); srt,src=sr_text(SR); vsrt,vsrc=vix_sr_text(VIX_SR)
 term_text="Risk-Off" if R3>=1.02 else ("Risk-On" if R3<=0.94 else "ניטרלי")
 term_cls="red" if R3>=1.02 else ("green" if R3<=0.94 else "white")
 
@@ -671,7 +694,8 @@ st.markdown('<div class="status-grid">'+
     status_row("Cross · EMA9/26 · 12H",cross_text,cross_cls)+
     status_row("Divergence 4H",d4,d4c)+
     status_row("Divergence 12H",d12,d12c)+
-    status_row("Support / Resistance · 12H",srt,src)+
+    status_row(f"{market_name} S/R · 12H",srt,src)+
+    status_row("VIX S/R · 12H",vsrt,vsrc)+
     status_row("Term Structure",term_text,term_cls)+
     status_row("VIX9D / VIX",("לחץ" if R9>=1.03 else ("רגוע" if R9<=0.97 else "מאוזן")),"red" if R9>=1.03 else ("green" if R9<=0.97 else "white"))+
     '</div>',unsafe_allow_html=True)
@@ -685,7 +709,8 @@ st.markdown(f'<div class="panel" style="text-align:center;font-weight:900">{acti
 with st.expander("פירוט החישוב"):
     st.write(f"VIX 12H {V12_LAST:.2f} · EMA9 {VE9:.2f} · EMA26 {VE26:.2f} · Cross proximity {CROSS_NEAR}/10")
     st.write(f"VIX 1D {C1:+.2f}% · 5D {C5:+.2f}% · VIX9D/VIX {R9:.3f} · VIX/VIX3M {R3:.3f}")
-    st.write(f"{market_name}: ללא EMA בציון · מומנטום 2D {M2:+.2f}% · 5D {M5:+.2f}% · Support/Resistance מחושב על 12H")
+    st.write(f"{market_name}: ללא EMA בציון · מומנטום 2D {M2:+.2f}% · 5D {M5:+.2f}% · S/R 12H: {SR} · תמיכה {SUPPORT:.2f} · התנגדות {RESISTANCE:.2f}")
+    st.write(f"VIX S/R 12H: {VIX_SR} · תמיכה {VIX_SUPPORT:.2f} · התנגדות {VIX_RESISTANCE:.2f} · משקל: ±0.55 ליד רמה, ±0.70 בפריצה/שבירה")
     st.write("RSI של VIX אינו מקבל ניקוד ישיר; הוא משמש רק לזיהוי Divergence מאומת ב-4H/12H עם סינון רעש מחמיר.")
     st.write(f"ציון משוקלל נטו: {score:+.2f} → Signal Score {signal_score:.2f}/10 · כיוון: {'SHORT' if signed_signal>0 else ('LONG' if signed_signal<0 else 'NEUTRAL')}")
     for pts,txt in sorted(reasons,key=lambda z:abs(z[0]),reverse=True):
@@ -696,7 +721,8 @@ with st.expander("מקורות נתונים / גיבוי"):
     st.write(f"VIX9D Daily: **{source_name(v9)}**")
     st.write(f"VIX3M Daily: **{source_name(v3)}**")
     st.write(f"{market_name} Daily: **{source_name(m)}**")
-    st.write(f"VIX 60m: **{source_name(v_intra)}**")
+    st.write(f"VIX Close 60m: **{source_name(v_intra)}**")
+    st.write(f"VIX OHLC 60m: **{source_name(vo_intra)}**")
     st.write(f"{market_name} 60m: **{source_name(m_intra)}**")
     st.caption("סדר הגיבוי: Yahoo/yfinance → Yahoo Chart API ישיר. לנתוני Daily בלבד: Cboe הרשמי למדדי VIX, ו-Stooq למדדי NDX/SPX.")
 

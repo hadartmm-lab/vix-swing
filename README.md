@@ -1,16 +1,24 @@
-# VIX Swing v10.1 — Multi-Source Resilient
+# VIX Swing v10.3 — Resilient + VIX S/R 12H
 
-גרסה מחוזקת של VIX Swing עם מנגנון גיבוי למקורות נתונים.
+מבוסס על v10.2 Resilient FIXED.
 
-## מה השתנה
-- Retry אוטומטי למשיכות Yahoo/yfinance.
-- מסלול גיבוי ישיר דרך Yahoo Chart API (query1/query2), במקרה שה-wrapper של yfinance נכשל.
-- גיבוי Daily רשמי של Cboe עבור VIX / VIX9D / VIX3M / VVIX.
-- גיבוי Daily עצמאי של Stooq עבור Nasdaq 100 / S&P 500.
-- אבחון ברור: האפליקציה מציגה איזה feed נכשל ומאיזה מקור כל סדרה התקבלה.
-- נתוני 12H נשארים קשיחים: אם אין נתוני 60m אמינים, האפליקציה לא מחליפה אותם ב-Daily כדי לא לשנות את לוגיקת השיטה.
+## חדש ב-v10.3
+- Support / Resistance נפרד ל-VIX על גרף 12H, מבוסס OHLC 60m שעובר resample ל-12H לפי סשן ניו-יורק.
+- ניקוד VIX S/R:
+  - תגובה/קרבה לתמיכה: +0.55 לכיוון SHORT ב-QQQ/Nasdaq.
+  - דחייה מהתנגדות: -0.55 לכיוון LONG.
+  - פריצה מאושרת מעל התנגדות: +0.70 SHORT.
+  - שבירה מאושרת מתחת לתמיכה: -0.70 LONG.
+- תצוגה נפרדת של Market S/R ושל VIX S/R.
+- רמות התמיכה וההתנגדות המדויקות מופיעות בפירוט החישוב.
 
-## Streamlit Cloud
-העלה את שלושת הקבצים (`app.py`, `requirements.txt`, `README.md`) לאותו repository והפעל את `app.py` כרגיל.
+## נשמר מ-v10.2
+- Yahoo/yfinance עם retry.
+- Yahoo Chart API ישיר כגיבוי.
+- Cboe/FRED ל-VIX family Daily לפי הצורך.
+- Stooq ל-NDX/SPX Daily לפי הצורך.
+- בניית 4H/12H מעוגנת לסשן ארה"ב.
+- RSI Divergence ב-VIX 4H/12H.
+- ניקוד Momentum, Term Structure, VIX9D/VIX, EMA9/26 ועוד.
 
-אין צורך ב-API key לגרסה הזאת.
+הכלי מחקרי בלבד ואינו ייעוץ השקעות.
