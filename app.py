@@ -852,12 +852,12 @@ def detect_clear_pattern(df, lookback=42, pivot=2):
 def status_row(name,value,cls="white"):
     return f'<div class="status"><div class="status-name"><bdi>{name}</bdi></div><div class="status-val {cls}"><bdi>{value}</bdi></div></div>'
 
-st.markdown('<div class="hero"><div class="hero-title">🎯 VIX Tactical</div><div class="muted">עסקאות קצרות · 1H טריגר · 4H אישור · 12H בונוס · v10.8</div></div>',unsafe_allow_html=True)
+st.markdown('<div class="hero"><div class="hero-title">🎯 VIX Tactical</div><div class="muted">עסקאות קצרות · 1H טריגר · 4H אישור · 12H כיוון/בונוס · v10.9</div></div>',unsafe_allow_html=True)
 if st.button("🔄 רענן",use_container_width=True): st.cache_data.clear(); st.rerun()
 
 st.markdown('<div class="panel" dir="rtl"><bdi dir="ltr">LONG</bdi> — חיפוש עלייה ב-QQQ/Nasdaq · <bdi dir="ltr">SHORT</bdi> — חיפוש ירידה ב-QQQ/Nasdaq<br><span class="muted">אין יותר ניקוד או אישור מה-Nasdaq/S&P עצמם. הכיוון נגזר מה-VIX בלבד.</span></div>', unsafe_allow_html=True)
 with st.expander("איך לקרוא את האיתות והזמנים"):
-    st.markdown('<div dir="rtl">המודל מיועד לעסקאות קצרות: <bdi dir="ltr">1H</bdi> הוא טריגר מהיר, <bdi dir="ltr">4H</bdi> הוא האישור המרכזי, ו-<bdi dir="ltr">12H</bdi> משמש כבונוס/הקשר. החישוב משתמש בנרות סגורים בלבד. סיכומי 4H/12H נוצרים מנתוני שעה זמינים ולכן הם סיכומי סשן ולא נרות בורסה מקוריים.</div>',unsafe_allow_html=True)
+    st.markdown('<div dir="rtl">המודל מיועד לסקאלפ/עסקאות קצרות: <bdi dir="ltr">4H</bdi> הוא גרף ה-Setup המרכזי, <bdi dir="ltr">1H</bdi> משמש לטריגר ותזמון, ו-<bdi dir="ltr">12H</bdi> משמש לכיוון/בונוס ואינו חייב Divergence. החישוב משתמש בנרות סגורים בלבד. סיכומי 4H/12H נוצרים מנתוני שעה זמינים ולכן הם סיכומי סשן ולא נרות בורסה מקוריים.</div>',unsafe_allow_html=True)
 
 with st.spinner("בודק נתוני VIX ומחשב… מקור שאינו מגיב עלול להאריך את הטעינה"):
     v=fetch_close("^VIX",period="6mo")
@@ -917,6 +917,27 @@ FIB12=smart_fib_state(VO12,lookback=55,pivot=2,min_impulse_pct=7.0)
 PAT1=detect_clear_pattern(VO1H,lookback=48,pivot=2)
 PAT4=detect_clear_pattern(VO4,lookback=42,pivot=2)
 
+
+def directional_context_12h(df):
+    """12H context only; never a mandatory trigger."""
+    if df is None or len(df) < 10:
+        return "neutral"
+    c = pd.to_numeric(df["Close"], errors="coerce").dropna()
+    if len(c) < 10:
+        return "neutral"
+    r = rsi(c, 14).dropna()
+    if len(r) < 4:
+        return "neutral"
+    price_move = float(c.iloc[-1] / c.iloc[-4] - 1.0)
+    rsi_move = float(r.iloc[-1] - r.iloc[-4])
+    if price_move >= 0.012 and rsi_move >= 2.0:
+        return "bullish"
+    if price_move <= -0.012 and rsi_move <= -2.0:
+        return "bearish"
+    return "neutral"
+
+CTX12 = directional_context_12h(VO12)
+
 # Institutional pressure metrics. Use relative/z-score logic rather than fixed raw levels
 # so the model adapts across calm and stressed volatility regimes.
 VV5=pctn(vv,5) if vv is not None else np.nan
@@ -927,6 +948,19 @@ SKEW5=pctn(skew,5) if skew is not None else np.nan
 SKEW_Z=rolling_zscore_last(skew,60) if skew is not None else np.nan
 COR5=pctn(cor1m,5) if cor1m is not None else np.nan
 COR_Z=rolling_zscore_last(cor1m,60) if cor1m is not None else np.nan
+
+# v10.10 Fast Pressure: emphasize *change/acceleration* in the front end.
+VV1=pctn(vv,1) if vv is not None else np.nan
+VV3=pctn(vv,3) if vv is not None else np.nan
+VIX1=pctn(v,1) if v is not None else np.nan
+VIX3=pctn(v,3) if v is not None else np.nan
+VV_ACCEL=(VV1-VIX1) if np.isfinite(VV1) and np.isfinite(VIX1) else np.nan
+VV_ACCEL3=(VV3-VIX3) if np.isfinite(VV3) and np.isfinite(VIX3) else np.nan
+
+FRONT_RATIO=aligned_ratio(v1,v9) if v1 is not None and v9 is not None else None
+FRONT_NOW=float(FRONT_RATIO.iloc[-1]) if FRONT_RATIO is not None and len(FRONT_RATIO) else np.nan
+FRONT_PREV=float(FRONT_RATIO.iloc[-2]) if FRONT_RATIO is not None and len(FRONT_RATIO)>=2 else np.nan
+FRONT_DELTA=((FRONT_NOW/FRONT_PREV)-1.0)*100 if np.isfinite(FRONT_NOW) and np.isfinite(FRONT_PREV) and FRONT_PREV!=0 else np.nan
 
 score=0.0; reasons=[]
 category_scores={"VIX Tactical":0.0,"Institutional":0.0,"Vol Curve":0.0}
@@ -950,6 +984,10 @@ elif DIV1==DIV4=="bearish": addcat("VIX Tactical",-0.80,"סנכרון Divergence
 
 if DIV12=="bullish": addcat("VIX Tactical", 0.50,"בונוס: VIX 12H Bullish Divergence → SHORT")
 elif DIV12=="bearish": addcat("VIX Tactical",-0.50,"בונוס: VIX 12H Bearish Divergence → LONG")
+
+# 12H can support direction even without divergence; small bonus only.
+if CTX12=="bullish": addcat("VIX Tactical", 0.35,"12H תומך בעליית VIX → בונוס SHORT (Divergence לא חובה)")
+elif CTX12=="bearish": addcat("VIX Tactical",-0.35,"12H תומך בירידת VIX → בונוס LONG (Divergence לא חובה)")
 
 # Clear patterns. Bullish pattern on VIX supports SHORT in QQQ; bearish pattern supports LONG.
 def score_pattern(pat, tf, w):
@@ -994,50 +1032,87 @@ def score_fib(f,z,tf,base,react):
 score_fib(FIB4,SR4,'4H',0.45,0.75)
 score_fib(FIB12,SR12,'12H',0.25,0.45)
 
+# v10.9 Reference Setup: complete 4H scalp setup can stand on its own.
+def fib_is_confirmed_for(direction):
+    if not FIB4.get("valid") or not fib_repeated_level_overlap(FIB4, SR4):
+        return False
+    phase = FIB4.get("phase")
+    if direction == "down":
+        return phase in ("reject_down","break_below_0618")
+    return phase in ("rebound_up","break_above_0618")
+
+ref_long = DIV4=="bearish" and PAT4.get("bias")=="bearish" and fib_is_confirmed_for("down")
+ref_short = DIV4=="bullish" and PAT4.get("bias")=="bullish" and fib_is_confirmed_for("up")
+
+if ref_long:
+    addcat("VIX Tactical",-1.20,"🔥 4H REFERENCE SETUP: Bearish Divergence + יתד/M + Fib 0.50–0.618 ב-S/R + דחייה/שבירה → LONG חזק")
+elif ref_short:
+    addcat("VIX Tactical", 1.20,"🔥 4H REFERENCE SETUP: Bullish Divergence + יתד/W + Fib 0.50–0.618 ב-S/R + תגובה/פריצה → SHORT חזק")
+
+
 # -----------------------------------------------------------------------------
-# 2) INSTITUTIONAL VOLATILITY PRESSURE — 25%
-# Approximation of professional options-desk pressure using public Cboe indices:
-# VVIX relative pressure, VIX1D short-end curve, SKEW tail demand, COR1M correlation.
-# Every component is optional; missing data is shown as reduced coverage, not guessed.
+# 2) INSTITUTIONAL FAST PRESSURE — 25%
+# Scalp-oriented confirmation layer, not an entry generator.
+# Weight mix inside this layer:
+# VIX1D immediate pressure 35% | VVIX acceleration 30% |
+# front-end curve acceleration 25% | SKEW + COR1M context 10%.
+# Missing public data reduces coverage; nothing is guessed.
 # -----------------------------------------------------------------------------
 institutional_available=0.0
 institutional_total=2.5
 
-if vv is not None and len(vv)>=30 and np.isfinite(VV_Z) and np.isfinite(VV_REL):
-    institutional_available += 0.9
-    if VV_Z>=1.0 and VV_REL>=4.0:
-        addcat("Institutional", 0.90,"VVIX מוביל את VIX משמעותית → Hidden Vol Pressure / SHORT")
-    elif VV_Z>=0.5 and VV_REL>=2.0:
-        addcat("Institutional", 0.55,"VVIX מתחזק יחסית ל-VIX → לחץ סמוי / SHORT")
-    elif VV_Z<=-1.0 and VV_REL<=-4.0:
-        addcat("Institutional",-0.90,"VVIX נחלש משמעותית מול VIX → Vol Relief / LONG")
-    elif VV_Z<=-0.5 and VV_REL<=-2.0:
-        addcat("Institutional",-0.55,"VVIX נחלש יחסית ל-VIX → רגיעה / LONG")
-
+# A) Immediate VIX1D pressure — max ±0.875 (35%)
 if v1 is not None and len(v1)>=20 and np.isfinite(R1) and np.isfinite(R1_9):
-    institutional_available += 0.8
+    institutional_available += 0.875
     if R1_9>=1.05 and R9>=1.02:
-        addcat("Institutional", 0.80,"VIX1D > VIX9D > VIX → לחץ בקצה הקצר / SHORT")
-    elif R1>=1.10:
-        addcat("Institutional", 0.55,"VIX1D בפרמיה חדה ל-VIX → Event Risk / SHORT")
+        addcat("Institutional", 0.875,"⚡ VIX1D > VIX9D > VIX → לחץ מיידי חזק / SHORT")
+    elif R1>=1.08:
+        addcat("Institutional", 0.60,"⚡ VIX1D בפרמיה ל-VIX → Immediate Event Pressure / SHORT")
     elif R1_9<=0.90 and R9<=0.98:
-        addcat("Institutional",-0.80,"VIX1D < VIX9D < VIX → רגיעה בקצה הקצר / LONG")
-    elif R1<=0.85 and R9<=1.00:
-        addcat("Institutional",-0.40,"VIX1D נמוך משמעותית מ-VIX → לחץ מיידי נמוך / LONG")
+        addcat("Institutional",-0.875,"⚡ VIX1D < VIX9D < VIX → רגיעה מיידית חזקה / LONG")
+    elif R1<=0.88:
+        addcat("Institutional",-0.55,"⚡ VIX1D חלש מול VIX → Immediate Vol Relief / LONG")
 
+# B) VVIX acceleration vs VIX — max ±0.75 (30%)
+if vv is not None and len(vv)>=30 and np.isfinite(VV_Z) and np.isfinite(VV_ACCEL):
+    institutional_available += 0.75
+    accel = VV_ACCEL
+    accel3 = VV_ACCEL3 if np.isfinite(VV_ACCEL3) else accel
+    if accel>=4.0 and accel3>=3.0:
+        addcat("Institutional", 0.75,"⚡ VVIX מאיץ מעל VIX → Fast Hidden Vol Pressure / SHORT")
+    elif accel>=2.0:
+        addcat("Institutional", 0.45,"VVIX מתחזק מהר יותר מ-VIX → SHORT confirmation")
+    elif accel<=-4.0 and accel3<=-3.0:
+        addcat("Institutional",-0.75,"⚡ VVIX נחלש מהר מול VIX → Fast Vol Relief / LONG")
+    elif accel<=-2.0:
+        addcat("Institutional",-0.45,"VVIX מאבד כוח מול VIX → LONG confirmation")
+
+# C) Front-end VIX1D/VIX9D acceleration — max ±0.625 (25%)
+if FRONT_RATIO is not None and len(FRONT_RATIO)>=2 and np.isfinite(FRONT_NOW) and np.isfinite(FRONT_DELTA):
+    institutional_available += 0.625
+    if FRONT_NOW>=1.03 and FRONT_DELTA>=2.0:
+        addcat("Institutional", 0.625,"⚡ Front-End curve מתהדק מהר → SHORT confirmation")
+    elif FRONT_NOW>=1.00 and FRONT_DELTA>=1.0:
+        addcat("Institutional", 0.35,"Front-End pressure עולה → SHORT")
+    elif FRONT_NOW<=0.95 and FRONT_DELTA<=-2.0:
+        addcat("Institutional",-0.625,"⚡ Front-End pressure נשבר מטה → LONG confirmation")
+    elif FRONT_NOW<=0.98 and FRONT_DELTA<=-1.0:
+        addcat("Institutional",-0.35,"Front-End pressure נחלש → LONG")
+
+# D) Slow context only — SKEW + COR1M together max ±0.25 (10%)
 if skew is not None and len(skew)>=30 and np.isfinite(SKEW_Z) and np.isfinite(SKEW5):
-    institutional_available += 0.4
+    institutional_available += 0.125
     if SKEW_Z>=0.75 and SKEW5>=2.0:
-        addcat("Institutional", 0.40,"SKEW עולה ומעל הנורמה → ביקוש Tail Risk / SHORT")
+        addcat("Institutional", 0.125,"SKEW Tail Risk עולה → Context SHORT")
     elif SKEW_Z<=-0.75 and SKEW5<=-2.0:
-        addcat("Institutional",-0.40,"SKEW נחלש ומתחת לנורמה → ירידת Tail Demand / LONG")
+        addcat("Institutional",-0.125,"SKEW Tail Risk נחלש → Context LONG")
 
 if cor1m is not None and len(cor1m)>=30 and np.isfinite(COR_Z) and np.isfinite(COR5):
-    institutional_available += 0.4
+    institutional_available += 0.125
     if COR_Z>=0.50 and COR5>=3.0:
-        addcat("Institutional", 0.40,"COR1M עולה → סיכון מערכתי / Herding / SHORT")
+        addcat("Institutional", 0.125,"COR1M עולה → Risk-Off context")
     elif COR_Z<=-0.50 and COR5<=-3.0:
-        addcat("Institutional",-0.40,"COR1M יורד → פיזור סיכון משתפר / LONG")
+        addcat("Institutional",-0.125,"COR1M יורד → Risk-On context")
 
 # -----------------------------------------------------------------------------
 # 3) VOL CURVE / VIX IMPULSE — 15%
@@ -1075,7 +1150,7 @@ elif signed_signal <= -STRONG_THRESHOLD: state,icon,cls="STRONG LONG","🟢","gr
 elif signed_signal <= -ENTRY_THRESHOLD: state,icon,cls="LONG","🔵","blue"
 else: state,icon,cls="WAIT","⚪","white"
 
-# Strong labels require a matching divergence on 1H or 4H. 12H alone is only a bonus.
+# Strong requires matching divergence on 1H or 4H. Complete 4H Reference Setup can stand alone; 12H divergence is not mandatory.
 if signal_score>=STRONG_THRESHOLD:
     matching_div='bullish' if signed_signal>0 else 'bearish'
     if DIV1!=matching_div and DIV4!=matching_div:
@@ -1102,8 +1177,8 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-st.caption(f"VIX Daily: {v.index[-1]:%d/%m/%Y} · 1H: {V1H.index[-1]:%d/%m %H:%M} · 4H: {V4.index[-1]:%d/%m %H:%M} · 12H: {V12.index[-1]:%d/%m %H:%M}")
-st.caption("המודל משתמש בנרות סגורים בלבד ואינו זמן-אמת Tick-by-Tick. הציון הוא סכום משקלים, לא אחוז הצלחה. הוא מכוון לעסקאות קצרות יותר ולא לבניית Swing ארוך. אין ביצוע עסקאות אוטומטי.")
+st.caption(f"Last data update · VIX Daily: {v.index[-1]:%d/%m/%Y} · 1H: {V1H.index[-1]:%d/%m %H:%M} · 4H: {V4.index[-1]:%d/%m %H:%M} · 12H: {V12.index[-1]:%d/%m %H:%M}")
+st.caption("Refresh מושך את הנתון האחרון שהמקורות מספקים; הניתוח הטכני משתמש בנרות סגורים בלבד ואינו Tick-by-Tick. הציון הוא סכום משקלים, לא אחוז הצלחה. הוא מכוון לעסקאות קצרות יותר ולא לבניית Swing ארוך. אין ביצוע עסקאות אוטומטי.")
 if data_coverage < 100:
     missing = [name for name,x in [("VVIX",vv),("VIX1D",v1),("SKEW",skew),("COR1M",cor1m)] if x is None]
     st.warning("כיסוי חלקי — רכיבים חסרים או לא עדכניים: " + ", ".join(missing))
@@ -1151,9 +1226,9 @@ def srzone_text(z):
     return "אין אזור רב-נגיעות פעיל","white"
 
 def institutional_text(v):
-    if v>=0.45: return f"Pressure {v:+.2f}/2.5 → SHORT","red"
-    if v<=-0.45: return f"Relief {v:+.2f}/2.5 → LONG","green"
-    return f"Neutral {v:+.2f}/2.5","white"
+    if v>=0.45: return f"FAST Pressure {v:+.2f}/2.5 → SHORT","red"
+    if v<=-0.45: return f"FAST Relief {v:+.2f}/2.5 → LONG","green"
+    return f"FAST Neutral {v:+.2f}/2.5","white"
 
 d1,d1c=div_text(DIV1); d4,d4c=div_text(DIV4); d12,d12c=div_text(DIV12)
 f4t,f4c=fib_text(FIB4); f12t,f12c=fib_text(FIB12)
@@ -1165,7 +1240,7 @@ term_cls="red" if R3>=1.02 else ("green" if R3<=0.94 else "white")
 
 st.markdown('<div class="status-grid">'+
     status_row("Divergence 1H · FAST TRIGGER",d1,d1c)+
-    status_row("Divergence 4H · MAIN CONFIRM",d4,d4c)+
+    status_row("Divergence 4H · MAIN SETUP",d4,d4c)+
     status_row("Divergence 12H · BONUS",d12,d12c)+
     status_row("Pattern 1H · W/M/Wedge",p1t,p1c)+
     status_row("Pattern 4H · W/M/Wedge",p4t,p4c)+

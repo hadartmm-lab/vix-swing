@@ -64,3 +64,24 @@ streamlit run app.py
 ```
 
 זהו כלי מחקרי ואינו מבצע עסקאות אוטומטית.
+
+
+## v10.9 Reference Setup upgrade
+- 4H = primary scalp / short-trade Setup.
+- 1H = timing / fast trigger. Missing 1H divergence does not invalidate a complete 4H setup.
+- 12H = direction/context bonus. 12H divergence is never mandatory.
+- 12H directional context bonus: ±0.35.
+- 4H Reference Setup bonus: ±1.20 when these align:
+  4H RSI divergence + confirmed W/M or wedge + Smart Fib 0.50–0.618 reaction/break at repeated S/R.
+- Symmetric logic: bearish VIX setup -> LONG Nasdaq/QQQ bias; bullish VIX setup -> SHORT Nasdaq/QQQ bias.
+- Closed candles only.
+
+## v10.10 Institutional Fast Pressure
+- Scalp-oriented institutional confirmation; it cannot create a trade by itself.
+- VIX1D immediate pressure: 35% of institutional layer (max ±0.875).
+- VVIX acceleration versus VIX: 30% (max ±0.75), emphasizing 1D/3D relative acceleration.
+- Front-end VIX1D/VIX9D acceleration: 25% (max ±0.625).
+- SKEW + COR1M: only 10% combined (max ±0.25), context rather than trigger.
+- Refresh pulls the newest observation exposed by each public source.
+- Technical 1H/4H/12H logic remains closed-candle only; not tick-by-tick.
+- UI now explicitly shows Last data update.
