@@ -1,54 +1,25 @@
-# VIX Swing v10.5 — Final Calibrated
+# VIX Swing v10.7 — Smart Fib Two-Way
 
-מבוסס על v10.4 Institutional Volatility Pressure, לאחר בדיקת robustness ובק־טסט אחרון על רכיבים שניתנים לאימות היסטורי בצורה נקייה.
+גרסה זו מבוססת ישירות על v10.6.1 Checked ומוסיפה שכבת Smart Fibonacci סימטרית ל-VIX על סיכומי 12H סגורים בלבד.
 
-## משקלי המודל הסופיים
-- **VIX Divergence + Reversal Structure — 45%**
-  - RSI Divergence 12H: עד ±1.90
-  - RSI Divergence 4H: עד ±1.00
-  - סנכרון 4H+12H: ±0.45
-  - Higher High + rejection ב-VIX: עד -0.65 לכיוון LONG Nasdaq
-  - Lower Low + rebound ב-VIX: עד +0.30 לכיוון SHORT Nasdaq
-  - VIX Support/Resistance 12H: עד ±0.50
-- **Institutional Volatility Pressure — 25%**
-  - VVIX relative pressure: עד ±0.90
-  - VIX1D short-end curve: עד ±0.80
-  - SKEW tail-risk pressure: ±0.40
-  - COR1M implied correlation: ±0.40
-- **Volatility Curve / VIX Impulse — 15%**
-  - VIX9D/VIX, VIX/VIX3M, תנועת VIX יומית/5D ורמת VIX.
-- **Nasdaq/S&P Confirmation — 10%**
-  - Momentum 2D/5D קיבל משקל קטן מאוד לאחר שלא הראה יתרון יציב בבק־טסט.
-  - Support/Resistance 12H הוא עיקר הקטגוריה.
-- **EMA9/26 — 5% בלבד**
-  - נשאר מסנן מגמה קטן בלבד.
+## מה חדש
+- זיהוי אוטומטי של ה-Impulse האחרון המשמעותי ב-VIX.
+- עוגנים דינמיים: אם נוצר קיצון חדש באותו מהלך, נקודת הסיום מתעדכנת.
+- אזור החלטה מרכזי: 0.50–0.618.
+- שני שלבים, לשני הכיוונים:
+  - VIX עולה לכיוון 0.50–0.618 + לפחות 2 אישורים נוספים -> SHORT Watch במדד.
+  - דחיית VIX מטה מהאזור + אישורים -> LONG במדד.
+  - VIX יורד לכיוון 0.50–0.618 + לפחות 2 אישורים נוספים -> LONG Watch במדד.
+  - Rebound של VIX מהאזור + אישורים -> SHORT במדד.
+- אם VIX פורץ את 0.618 בכיוון התנועה עם אישורים, המודל לא מבצע היפוך אוטומטי אלא מאפשר המשך הכיוון.
+- פיבונאצ'י אינו טריגר עצמאי: ניקוד Fib ניתן רק עם לפחות 2 אישורים נוספים מתוך divergence, S/R structure, EMA direction ו-4H momentum.
+- ממשק חדש מציג Impulse, טווח 0.50–0.618, מצב נוכחי ומספר אישורי עלייה/ירידה.
 
-## כיול Swing סופי
-Swing exhaustion דורש כעת לפחות **1.5%** יצירת שיא/שפל חדש וגם **1.5% rejection/rebound** לפני קבלת ניקוד. כך שיא עולה או שפל יורד לבדם אינם מתפרשים בטעות כהיפוך.
+## התקנה
+```bash
+pip install -r requirements.txt
+streamlit run app.py
+```
 
-הבק־טסט האחרון הצביע על אסימטריה: Higher High + rejection ב-VIX היה שימושי יותר לזיהוי אפשרות לירידת VIX / LONG Nasdaq מאשר Lower Low + rebound לזיהוי SHORT. לכן המשקלים אינם סימטריים.
-
-## Institutional Volatility Pressure
-- **VVIX** — תנודתיות צפויה של VIX / לחץ convexity.
-- **VIX1D** — לחץ מיידי בקצה הקצר מול VIX9D/VIX.
-- **SKEW** — ביקוש ל-tail risk.
-- **COR1M** — implied correlation / herd behavior.
-
-הרכיבים משתמשים בשינויים יחסיים וב-z-score כדי להתאים לרג'ימים שונים.
-
-## גיבויי נתונים
-- Yahoo/yfinance עם retry.
-- Yahoo Chart API ישיר.
-- Cboe הרשמי למדדי VIX / VVIX / VIX1D / SKEW / COR1M כאשר זמין.
-- FRED לגיבוי VIX/VIX3M.
-- Stooq לגיבוי NDX/SPX Daily.
-- אם רכיב Institutional חסר, האפליקציה לא ממציאה נתון אלא מורידה Data Coverage.
-
-## ממשק
-- Signal Score 0–10.
-- Top Drivers — שלושת הגורמים החזקים ביותר כרגע.
-- Data Coverage.
-- Institutional Vol Pressure בשורה ברורה.
-- Divergence 12H מסומן כ-High Weight, EMA9/26 כ-Low Weight.
-
-הכלי מחקרי בלבד ואינו ייעוץ השקעות.
+## הערה
+הגרסה משתמשת בנרות/סיכומי סשן סגורים בלבד וממשיכה את מנגנון Multi-Source של v10.6.1. זהו כלי מחקרי; Fib הוא אזור יעד/תגובה ולא הבטחה לתנועה או אות כניסה עצמאי.

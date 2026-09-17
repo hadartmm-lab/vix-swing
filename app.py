@@ -8,14 +8,192 @@ from io import StringIO
 from urllib.parse import quote
 from datetime import datetime
 
+# Embedded data validation; no separate data_quality.py is required.
+"""Closed-session validation shared by the UI and regression tests."""
+from functools import lru_cache
+import numpy as np
+import pandas as pd
+import exchange_calendars as xc
+
+TZ = 'America/New_York'
+
+
+def utc_now(now=None):
+    x = pd.Timestamp.now(tz='UTC') if now is None else pd.Timestamp(now)
+    return x.tz_localize('UTC') if x.tz is None else x.tz_convert('UTC')
+
+
+@lru_cache(maxsize=8)
+def calendar_for(year):
+    return xc.get_calendar('XNYS', start=f'{year-2}-01-01', end=f'{year+1}-12-31')
+
+
+def schedule(now=None):
+    return calendar_for(utc_now(now).year).schedule
+
+
+def latest_daily_session(now=None):
+    now = utc_now(now)
+    # Allow the volatility index closing calculation and provider publication.
+    sched = schedule(now)
+    closed = sched[sched['close'] + pd.Timedelta(hours=1) <= now]
+    return closed.index[-1].tz_localize(None).normalize()
+
+
+def clean_history(obj):
+    if obj is None or obj.empty or not isinstance(obj.index, pd.DatetimeIndex):
+        return None
+    x = obj.copy()
+    x = x.loc[~x.index.isna()]
+    x = x.loc[~x.index.duplicated(keep='last')].sort_index()
+    x = x.apply(pd.to_numeric, errors='coerce') if isinstance(x, pd.DataFrame) else pd.to_numeric(x, errors='coerce')
+    x = x.replace([np.inf, -np.inf], np.nan).dropna()
+    if isinstance(x, pd.DataFrame):
+        required = ['Open', 'High', 'Low', 'Close']
+        if not all(c in x for c in required):
+            return None
+        good = (x[required] > 0).all(axis=1)
+        good &= x.High >= x[['Open','Close','Low']].max(axis=1)
+        good &= x.Low <= x[['Open','Close','High']].min(axis=1)
+        x = x.loc[good]
+    else:
+        x = x[x > 0]
+    return x if len(x) else None
+
+
+def daily_history(obj, now=None):
+    x = clean_history(obj)
+    if x is None:
+        return None
+    # Daily dates are exchange date labels, not UTC instants.
+    x.index = x.index.tz_localize(None).normalize()
+    x = x.loc[~x.index.duplicated(keep='last')]
+    sched = schedule(now)
+    x = x.loc[x.index.isin(sched.index.tz_localize(None))]
+    cutoff = latest_daily_session(now)
+    return x.loc[x.index <= cutoff]
+
+
+def feed_phase(obj):
+    """Use the dominant hourly timestamp phase; never shift source timestamps."""
+    idx=obj.index
+    idx=idx.tz_localize(TZ) if idx.tz is None else idx.tz_convert(TZ)
+    minutes=pd.Series(idx.minute)
+    return int(minutes.mode().iloc[0])
+
+
+def hourly_grid(op, cl, phase):
+    first=op.floor('h')+pd.Timedelta(minutes=phase)
+    if first<op:
+        first+=pd.Timedelta(hours=1)
+    return pd.date_range(first,cl,freq='1h',inclusive='left')
+
+
+def bucket_grid(op,cl,hours,phase):
+    starts=hourly_grid(op,cl,phase)
+    for label in pd.date_range(op,cl,freq=f'{hours}h',inclusive='left'):
+        boundary=min(label+pd.Timedelta(hours=hours),cl)
+        expected=starts[(starts>=label)&(starts<boundary)]
+        if not len(expected):
+            continue
+        # Source hours can straddle a bucket edge. Do not pretend they closed earlier.
+        end=min(expected[-1]+pd.Timedelta(hours=1),cl)
+        yield label,expected,end
+
+
+def fresh_history(obj, interval, now=None):
+    if obj is None or obj.empty:
+        return False
+    if interval == '1d':
+        return obj.index[-1].tz_localize(None).normalize() == latest_daily_session(now)
+    now=utc_now(now)
+    phase=feed_phase(obj)
+    sched=schedule(now)
+    sched=sched[(sched['open']<=now)&(sched['close']>=now-pd.Timedelta(days=10))]
+    expected=None
+    for _,day in sched.iterrows():
+        for t in hourly_grid(day['open'],day['close'],phase):
+            if min(t+pd.Timedelta(hours=1),day['close'])+pd.Timedelta(minutes=15)<=now:
+                expected=t
+    idx=obj.index
+    idx=idx.tz_localize(TZ) if idx.tz is None else idx.tz_convert(TZ)
+    # Ignore premarket and after-hours ticks when deciding regular-session freshness.
+    return expected is not None and expected in idx.tz_convert('UTC')
+
+
+def session_bars(obj, hours, now=None):
+    """Aggregate actual hourly samples using their native timestamp phase.
+
+    These are session summaries, not exact exchange-native 4h/12h candles.
+    :00/:15/:30 feeds remain on their real timestamps. Require every expected
+    in-session sample on that grid and wait until its source candle closes.
+    """
+    x=clean_history(obj)
+    if x is None or hours not in (4,12):
+        return None
+    now=utc_now(now)
+    phase=feed_phase(x)
+    x.index=x.index.tz_localize(TZ) if x.index.tz is None else x.index.tz_convert(TZ)
+    x.index=x.index.tz_convert('UTC')
+    sched=schedule(now)
+    sched=sched[(sched['close']>=x.index.min())&(sched['open']<=now)]
+    rows,labels=[],[]
+    for _,day in sched.iterrows():
+        for label,expected,end in bucket_grid(day['open'],day['close'],hours,phase):
+            if end+pd.Timedelta(minutes=15)>now or not expected.isin(x.index).all():
+                continue
+            part=x.loc[expected]
+            labels.append(label)
+            if isinstance(x,pd.DataFrame):
+                rows.append({'Open':part.Open.iloc[0],'High':part.High.max(),
+                             'Low':part.Low.min(),'Close':part.Close.iloc[-1]})
+            else:
+                rows.append(part.iloc[-1])
+    if not rows:
+        return None
+    idx=pd.DatetimeIndex(labels).tz_convert(TZ)
+    out=pd.DataFrame(rows,index=idx) if isinstance(x,pd.DataFrame) else pd.Series(rows,index=idx)
+    out.attrs=obj.attrs.copy()
+    out.attrs['hourly_phase_minutes']=phase
+    return out
+
+
+def rsi_series(s, n=14):
+    """Wilder RSI: SMA seed then recursive smoothing, with explicit flat cases."""
+    s = pd.to_numeric(s,errors='coerce')
+    result = pd.Series(np.nan,index=s.index,dtype=float)
+    if len(s) <= n:
+        return result
+    d=s.diff(); up=d.clip(lower=0); down=-d.clip(upper=0)
+    gain,loss=float(up.iloc[1:n+1].mean()),float(down.iloc[1:n+1].mean())
+    for i in range(n,len(s)):
+        if i>n:
+            gain=(gain*(n-1)+up.iloc[i])/n
+            loss=(loss*(n-1)+down.iloc[i])/n
+        result.iloc[i] = (50.0 if gain==0 else 100.0) if loss==0 else 100-100/(1+gain/loss)
+    return result
+
+
+def latest_bucket_start(hours, now=None, obj=None):
+    now=utc_now(now)
+    phase=feed_phase(obj) if obj is not None else 30
+    sched=schedule(now)
+    sched=sched[(sched['open']<=now)&(sched['close']>=now-pd.Timedelta(days=10))]
+    result=None
+    for _,day in sched.iterrows():
+        for label,_,end in bucket_grid(day['open'],day['close'],hours,phase):
+            if end+pd.Timedelta(minutes=15)<=now:
+                result=label.tz_convert(TZ)
+    return result
+
 st.set_page_config(page_title="VIX Swing", page_icon="🎯", layout="centered")
 
 st.markdown('''
 <style>
 :root{--bg:#07131f;--card:#0b1f31;--line:#184869;--txt:#f5f7fb;--muted:#b9c8d6}
 html,body,[class*="css"]{background:var(--bg);color:var(--txt)}
-.stApp{background:linear-gradient(180deg,#07131f 0%,#081725 100%)}
-.block-container{max-width:820px;padding-top:.8rem;padding-bottom:2rem}
+[data-testid="stHeader"]{background:#07131f;color:#f5f7fb}.stApp{background:linear-gradient(180deg,#07131f 0%,#081725 100%)}
+.block-container{max-width:820px;padding-top:3.5rem;padding-bottom:2rem}
 .hero{background:#0b1f31;border:1px solid var(--line);border-radius:20px;padding:16px 18px;margin-bottom:12px}
 .hero-title{font-size:1.7rem;font-weight:950;color:#ffffff}.muted{color:#c9d7e3;font-size:.88rem}
 .signal{background:linear-gradient(180deg,#0c2235 0%,#091b2b 100%);border:1px solid #245a7f;border-radius:24px;padding:20px 18px 18px;margin:12px 0;text-align:center;box-shadow:0 10px 35px rgba(0,0,0,.20)}
@@ -30,7 +208,7 @@ html,body,[class*="css"]{background:var(--bg);color:var(--txt)}
 .status-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:9px;margin-top:10px}
 @media(max-width:640px){.status-grid{grid-template-columns:1fr}}
 .status{background:#0a1a28;border:1px solid #214d6b;border-radius:15px;padding:11px 13px;display:flex;justify-content:space-between;align-items:center;gap:12px}
-.status-name{font-weight:850;font-size:.92rem;color:#eef5fa}.status-val{font-weight:900;text-align:left;white-space:nowrap}
+.status-name{font-weight:850;font-size:.92rem;color:#eef5fa}.status-val{font-weight:900;text-align:left;overflow-wrap:anywhere}.hero,.status,.panel,.drivers-card{direction:rtl} [data-testid="stMarkdownContainer"] p,[data-testid="stCaptionContainer"] p,[data-testid="stAlertContainer"]{direction:rtl;text-align:right;unicode-bidi:plaintext} bdi{unicode-bidi:isolate}.gauge-wrap{direction:ltr}
 .green{color:#72e8a7}.red{color:#ff8c92}.orange{color:#ffc06d}.blue{color:#82c9ff}.yellow{color:#ffe47b}.white{color:#fff}
 .panel{background:#0b1f31;border:1px solid var(--line);border-radius:18px;padding:14px;margin-top:11px;color:#ffffff}
 .panel, .panel *{color:#ffffff!important}
@@ -50,7 +228,7 @@ html,body,[class*="css"]{background:var(--bg);color:var(--txt)}
 
 DATA_TIMEOUT = 8
 HTTP_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (VIX-Swing/10.5; Streamlit)",
+    "User-Agent": "Mozilla/5.0 (VIX-Swing/10.7; Streamlit)",
     "Accept": "application/json,text/csv,*/*",
 }
 
@@ -118,7 +296,7 @@ def _extract_yf_ohlc(df):
 
 def _yfinance_download(ticker, period, interval):
     """yfinance with short retry/backoff. Returns the raw DataFrame or None."""
-    for attempt in range(3):
+    for attempt in range(2):
         try:
             df = yf.download(
                 ticker,
@@ -233,6 +411,7 @@ def _fred_daily_close(ticker):
         r = requests.get(url, headers=HTTP_HEADERS, timeout=DATA_TIMEOUT)
         r.raise_for_status()
         df = pd.read_csv(StringIO(r.text))
+        df = df.rename(columns={"observation_date": "DATE"})
         if "DATE" not in df.columns or series_id not in df.columns:
             return None
         idx = pd.to_datetime(df["DATE"], errors="coerce")
@@ -275,38 +454,42 @@ def _min_points_required(period, interval):
         return 20 if period == "1mo" else 30
     return 30
 
+def _prepare_history(obj, interval):
+    return daily_history(obj) if interval == "1d" else clean_history(obj)
+
 def _valid_history(s, period, interval):
-    return s is not None and len(s) >= _min_points_required(period, interval)
+    return (s is not None and len(s) >= _min_points_required(period, interval)
+            and fresh_history(s, interval))
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_close(ticker, period="6mo", interval="1d"):
     # 1) yfinance wrapper. A non-empty result is not enough: Yahoo sometimes
     # returns only one bar for VIX9D/VIX3M, which is unusable for indicators.
     df = _yfinance_download(ticker, period, interval)
-    c = _extract_yf_close(df)
+    c = _prepare_history(_extract_yf_close(df), interval)
     if _valid_history(c, period, interval):
         return _mark_source(c, "Yahoo / yfinance")
 
     # 2) Direct Yahoo Chart API through two hosts.
     df = _yahoo_chart_df(ticker, period, interval)
-    c = _extract_yf_close(df)
+    c = _prepare_history(_extract_yf_close(df), interval)
     if _valid_history(c, period, interval):
         return _mark_source(c, "Yahoo Chart API")
 
     # 3) Independent daily fallbacks.
     if interval == "1d":
         c = _cboe_daily_close(ticker)
-        c = _tail_for_period(c, period) if c is not None else None
+        c = _prepare_history(_tail_for_period(c, period), interval)
         if _valid_history(c, period, interval):
             return _mark_source(c, "Cboe official")
 
         c = _fred_daily_close(ticker)
-        c = _tail_for_period(c, period) if c is not None else None
+        c = _prepare_history(_tail_for_period(c, period), interval)
         if _valid_history(c, period, interval):
             return _mark_source(c, "FRED / Cboe")
 
         c = _stooq_daily_close(ticker)
-        c = _tail_for_period(c, period) if c is not None else None
+        c = _prepare_history(_tail_for_period(c, period), interval)
         if _valid_history(c, period, interval):
             return _mark_source(c, "Stooq")
     return None
@@ -314,89 +497,24 @@ def fetch_close(ticker, period="6mo", interval="1d"):
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_ohlc(ticker, period="3mo", interval="1d"):
     df = _yfinance_download(ticker, period, interval)
-    out = _extract_yf_ohlc(df)
-    if out is not None and len(out):
+    out = _prepare_history(_extract_yf_ohlc(df), interval)
+    if _valid_history(out, period, interval):
         return _mark_source(out, "Yahoo / yfinance")
 
     df = _yahoo_chart_df(ticker, period, interval)
-    out = _extract_yf_ohlc(df)
-    if out is not None and len(out):
+    out = _prepare_history(_extract_yf_ohlc(df), interval)
+    if _valid_history(out, period, interval):
         return _mark_source(out, "Yahoo Chart API")
     return None
 
 def ema_series(s,n): return s.ewm(span=n,adjust=False).mean()
 def pctn(s,n): return float((s.iloc[-1]/s.iloc[-1-n]-1)*100) if s is not None and len(s)>n else np.nan
 
-def rsi_series(s,n=14):
-    d=s.diff(); up=d.clip(lower=0); dn=-d.clip(upper=0)
-    au=up.ewm(alpha=1/n,adjust=False).mean(); ad=dn.ewm(alpha=1/n,adjust=False).mean()
-    rs=au/ad.replace(0,np.nan)
-    return 100-100/(1+rs)
-
-def _to_new_york_index(obj):
-    """Return a copy indexed in America/New_York for stable US-market session bars."""
-    if obj is None or not isinstance(obj.index, pd.DatetimeIndex):
-        return None
-    x = obj.copy()
-    idx = x.index
-    try:
-        if idx.tz is None:
-            # Yahoo intraday data for US tickers is normally exchange-local;
-            # make that assumption explicit rather than letting resample anchor to UTC/local host time.
-            idx = idx.tz_localize("America/New_York", ambiguous="infer", nonexistent="shift_forward")
-        else:
-            idx = idx.tz_convert("America/New_York")
-        x.index = idx
-        return x.sort_index()
-    except Exception:
-        return None
-
 def resample_close(s, hours):
-    """Build 4H/12H bars anchored to the US regular session (09:30 ET).
-
-    This avoids midnight/UTC bucket drift. 4H bars become 09:30-13:30 and
-    13:30-close; a 12H bar starts at 09:30 and contains the full regular
-    session. Empty overnight buckets are discarded.
-    """
-    if s is None or len(s) < 20 or not isinstance(s.index, pd.DatetimeIndex):
-        return None
-    x = _to_new_york_index(s)
-    if x is None:
-        return None
-    try:
-        # Keep regular US market session only. Yahoo hourly stamps can be 09:30 or 09:00
-        # depending on feed normalization, so include 09:00 then anchor buckets at 09:30.
-        x = x.between_time("09:00", "16:00", inclusive="both")
-        out = x.resample(
-            f"{hours}h",
-            origin="start_day",
-            offset="9h30min",
-            label="left",
-            closed="left",
-        ).last().dropna()
-        return out
-    except Exception:
-        return None
+    return session_bars(s, hours)
 
 def resample_ohlc(df, hours):
-    """Build session-anchored OHLC bars in America/New_York."""
-    if df is None or len(df) < 20 or not isinstance(df.index, pd.DatetimeIndex):
-        return None
-    x = _to_new_york_index(df)
-    if x is None:
-        return None
-    try:
-        x = x.between_time("09:00", "16:00", inclusive="both")
-        out = x.resample(
-            f"{hours}h",
-            origin="start_day",
-            offset="9h30min",
-            label="left",
-            closed="left",
-        ).agg({"Open":"first","High":"max","Low":"min","Close":"last"}).dropna()
-        return out
-    except Exception:
-        return None
+    return session_bars(df, hours)
 
 def rolling_zscore_last(s, window=60):
     if s is None:
@@ -435,8 +553,8 @@ def aligned_ratio(a, b):
 def swing_exhaustion_signal(s, lookback=45, pivot=2, recent_bars=7, min_swing_pct=0.8, rejection_pct=1.0):
     """Detect recent VIX swing exhaustion, not trend continuation.
 
-    - New higher high that has already rejected lower can precede VIX fading -> Nasdaq LONG.
-    - New lower low that has already rebounded can precede VIX rising -> Nasdaq SHORT.
+    - New higher high that has already rejected lower can precede VIX fading -> מדד LONG.
+    - New lower low that has already rebounded can precede VIX rising -> מדד SHORT.
     We deliberately require the rejection/rebound so a bare higher-high/lower-low is not
     incorrectly treated as a reversal by itself.
     """
@@ -457,14 +575,14 @@ def swing_exhaustion_signal(s, lookback=45, pivot=2, recent_bars=7, min_swing_pc
             new_high=(x.iloc[b]/x.iloc[a]-1)*100
             rejection=(last/x.iloc[b]-1)*100
             if new_high >= min_swing_pct and rejection <= -rejection_pct:
-                return "higher_high_rejection"  # VIX downside / Nasdaq LONG
+                return "higher_high_rejection"  # VIX downside / מדד LONG
     if len(lows)>=2:
         a,b=lows[-2],lows[-1]
         if len(x)-1-b <= recent_bars:
             new_low=(x.iloc[b]/x.iloc[a]-1)*100
             rebound=(last/x.iloc[b]-1)*100
             if new_low <= -min_swing_pct and rebound >= rejection_pct:
-                return "lower_low_rebound"  # VIX upside / Nasdaq SHORT
+                return "lower_low_rebound"  # VIX upside / מדד SHORT
     return "none"
 
 def detect_divergence(s, lookback=45, pivot=2, min_sep=3, min_price_pct=0.7, min_rsi_delta=4.0, recent_bars=8):
@@ -481,7 +599,7 @@ def detect_divergence(s, lookback=45, pivot=2, min_sep=3, min_price_pct=0.7, min
     x = s.dropna().iloc[-lookback:]
     if len(x) < 30:
         return "none"
-    r = rsi_series(x, 14)
+    r = rsi_series(s.dropna(), 14).reindex(x.index)
 
     lows, highs = [], []
     for i in range(pivot, len(x) - pivot):
@@ -559,19 +677,123 @@ def support_resistance_signal(df,lookback=22,pivot=2):
     if low<=support*1.005 and close>support*1.002: return "bounce_support",support,resistance
     return "neutral",support,resistance
 
-def status_row(name,value,cls="white"):
-    return f'<div class="status"><div class="status-name">{name}</div><div class="status-val {cls}">{value}</div></div>'
+def smart_fib_state(df, lookback=55, pivot=2, min_impulse_pct=7.0):
+    """Two-way Smart Fibonacci on closed 12H VIX OHLC bars.
 
-st.markdown('<div class="hero"><div class="hero-title">🎯 VIX Swing</div><div class="muted">כיוון QQQ / Nasdaq במבט אחד</div></div>',unsafe_allow_html=True)
+    Finds the latest meaningful confirmed swing impulse, then extends its endpoint
+    if a newer extreme is made in the same direction. The 0.50-0.618 retracement
+    area is treated as a *decision zone*, never as a standalone entry signal.
+
+    Returns a dict with direction, anchors, zone and phase. Direction refers to
+    the VIX impulse: 'down' = high->low; 'up' = low->high.
+    """
+    empty={"valid":False,"direction":None,"start":np.nan,"end":np.nan,
+           "level50":np.nan,"level618":np.nan,"zone_low":np.nan,"zone_high":np.nan,
+           "current":np.nan,"phase":"none","distance_pct":np.nan,"impulse_pct":np.nan}
+    x=clean_history(df)
+    if x is None or len(x)<18:
+        return empty
+    x=x.iloc[-lookback:].copy()
+    highs=[]; lows=[]
+    for i in range(pivot,len(x)-pivot):
+        wh=x['High'].iloc[i-pivot:i+pivot+1]
+        wl=x['Low'].iloc[i-pivot:i+pivot+1]
+        if x['High'].iloc[i]==wh.max() and (wh==x['High'].iloc[i]).sum()==1:
+            highs.append(i)
+        if x['Low'].iloc[i]==wl.min() and (wl==x['Low'].iloc[i]).sum()==1:
+            lows.append(i)
+    pts=sorted([(i,'H',float(x['High'].iloc[i])) for i in highs]+[(i,'L',float(x['Low'].iloc[i])) for i in lows])
+    # Consecutive same-type pivots are compressed to the more extreme one.
+    compact=[]
+    for pt in pts:
+        if compact and compact[-1][1]==pt[1]:
+            if (pt[1]=='H' and pt[2]>=compact[-1][2]) or (pt[1]=='L' and pt[2]<=compact[-1][2]):
+                compact[-1]=pt
+        else:
+            compact.append(pt)
+    candidates=[]
+    for a,b in zip(compact,compact[1:]):
+        if a[1]=='L' and b[1]=='H':
+            move=(b[2]/a[2]-1)*100
+            if move>=min_impulse_pct: candidates.append((b[0],a,b,'up',move))
+        elif a[1]=='H' and b[1]=='L':
+            move=(a[2]/b[2]-1)*100
+            if move>=min_impulse_pct: candidates.append((b[0],a,b,'down',move))
+    if not candidates:
+        return empty
+    _,a,b,direction,move=max(candidates,key=lambda z:z[0])
+    start_i,end_i=a[0],b[0]
+    start=float(a[2]); end=float(b[2])
+    # Dynamic endpoint: if the same impulse keeps making a new extreme, extend it.
+    tail=x.iloc[end_i:]
+    if direction=='up':
+        rel=int(np.argmax(tail['High'].to_numpy()))
+        candidate=float(tail['High'].iloc[rel])
+        if candidate>end:
+            end=candidate; end_i=end_i+rel
+    else:
+        rel=int(np.argmin(tail['Low'].to_numpy()))
+        candidate=float(tail['Low'].iloc[rel])
+        if candidate<end:
+            end=candidate; end_i=end_i+rel
+    rng=abs(end-start)
+    if rng<=0:
+        return empty
+    if direction=='down':
+        level50=end+0.50*rng
+        level618=end+0.618*rng
+    else:
+        level50=end-0.50*rng
+        level618=end-0.618*rng
+    zone_low=min(level50,level618); zone_high=max(level50,level618)
+    cur=float(x['Close'].iloc[-1]); prev=float(x['Close'].iloc[-2])
+    recent=x.iloc[-3:]
+    mom=cur-float(x['Close'].iloc[-3])
+    tol=max(0.04,0.015*rng)
+    break_buf=max(0.03,0.008*rng)
+    phase='tracking'
+    # The retracement route and the reaction are intentionally symmetric.
+    if direction=='down':
+        touched=float(recent['High'].max()) >= zone_low-tol
+        if cur < zone_low-tol:
+            phase='approaching_up' if mom>0 else 'below_zone'
+        elif cur <= zone_high+tol:
+            phase='reject_down' if touched and cur<prev and mom<0 else 'decision_zone'
+        else:
+            phase='break_above_0618' if cur>zone_high+break_buf else 'above_zone'
+    else:
+        touched=float(recent['Low'].min()) <= zone_high+tol
+        if cur > zone_high+tol:
+            phase='approaching_down' if mom<0 else 'above_zone'
+        elif cur >= zone_low-tol:
+            phase='rebound_up' if touched and cur>prev and mom>0 else 'decision_zone'
+        else:
+            phase='break_below_0618' if cur<zone_low-break_buf else 'below_zone'
+    if cur<zone_low: dist=(zone_low-cur)/cur*100
+    elif cur>zone_high: dist=(cur-zone_high)/cur*100
+    else: dist=0.0
+    return {"valid":True,"direction":direction,"start":start,"end":end,
+            "start_time":x.index[start_i],"end_time":x.index[end_i],
+            "level50":float(level50),"level618":float(level618),
+            "zone_low":float(zone_low),"zone_high":float(zone_high),"current":cur,
+            "phase":phase,"distance_pct":float(dist),"impulse_pct":float(move)}
+
+def status_row(name,value,cls="white"):
+    return f'<div class="status"><div class="status-name"><bdi>{name}</bdi></div><div class="status-val {cls}"><bdi>{value}</bdi></div></div>'
+
+st.markdown('<div class="hero"><div class="hero-title">🎯 VIX Swing</div><div class="muted">כיוון המדד במבט אחד · v10.7 Smart Fib</div></div>',unsafe_allow_html=True)
 if st.button("🔄 רענן",use_container_width=True): st.cache_data.clear(); st.rerun()
 
 market_name=st.radio("מדד",["Nasdaq 100","S&P 500"],horizontal=True,label_visibility="collapsed")
 market_ticker="^NDX" if market_name=="Nasdaq 100" else "^GSPC"
+st.markdown(f'<div class="panel" dir="rtl">הכיוון מתייחס למדד שנבחר: <bdi dir="ltr">{market_name}</bdi><br><bdi dir="ltr">LONG</bdi> — חיפוש עלייה במדד<br><bdi dir="ltr">SHORT</bdi> — חיפוש ירידה במדד</div>', unsafe_allow_html=True)
+with st.expander("איך לקרוא את האיתות והזמנים"):
+    st.markdown('<div dir="rtl">החישוב משתמש בנרות סגורים בלבד. הכינוי <bdi dir="ltr">12H</bdi> הוא סיכום סשן מסחר, ולא נר של 12 שעות רצופות. סיכומי <bdi dir="ltr">4H</bdi> ונתוני הסשן תלויים בשעות שמספק המקור; כשנרות המקור אינם מיושרים לפתיחה, הסיכומים מקורבים ואינם כוללים חלק פתיחה שאין עליו נר מלא. נשמר מרווח פרסום של 15 דקות.</div>',unsafe_allow_html=True)
 
-with st.spinner("מחשב..."):
+with st.spinner("בודק נתונים ומחשב… מקור שאינו מגיב עלול להאריך את הטעינה"):
     v=fetch_close("^VIX",period="6mo")
-    v_intra=fetch_close("^VIX",period="60d",interval="60m")
     vo_intra=fetch_ohlc("^VIX",period="60d",interval="60m")
+    v_intra=vo_intra["Close"] if vo_intra is not None else None
     v9=fetch_close("^VIX9D",period="6mo")
     v3=fetch_close("^VIX3M",period="6mo")
     vv=fetch_close("^VVIX",period="6mo")
@@ -581,9 +803,14 @@ with st.spinner("מחשב..."):
     skew=fetch_close("^SKEW",period="6mo")
     cor1m=fetch_close("^COR1M",period="6mo")
     m=fetch_close(market_ticker,period="6mo")
-    m_intra=fetch_close(market_ticker,period="60d",interval="60m")
     mo_intra=fetch_ohlc(market_ticker,period="60d",interval="60m")
+    m_intra=mo_intra["Close"] if mo_intra is not None else None
 
+# Revalidate cached frames as the session changes.
+v, v9, v3, vv, v1, skew, cor1m, m = [
+    x if _valid_history(x,"6mo","1d") else None
+    for x in (v,v9,v3,vv,v1,skew,cor1m,m)
+]
 required_daily = {
     "VIX": v,
     "VIX9D": v9,
@@ -592,7 +819,7 @@ required_daily = {
 }
 failed_daily = [name for name, x in required_daily.items() if x is None or len(x) < 30]
 if failed_daily:
-    st.error("לא הצלחתי להשיג נתונים תקינים עבור: " + ", ".join(failed_daily) + ". ניסיתי Yahoo, מקור Yahoo ישיר, Cboe הרשמי, FRED ובמידת האפשר גם Stooq.")
+    st.error("לא הצלחתי להשיג נתונים מלאים ועדכניים עבור: " + ", ".join(failed_daily) + ". ניסיתי Yahoo, מקור Yahoo ישיר, Cboe הרשמי, FRED ובמידת האפשר גם Stooq.")
     with st.expander("אבחון מקורות נתונים"):
         for name, x in required_daily.items():
             st.write(f"{name}: {'✅' if x is not None and len(x)>=30 else '❌'} · {source_name(x)} · {len(x) if x is not None else 0} נקודות")
@@ -612,13 +839,30 @@ if V12 is None or len(V12)<30 or VO12 is None or len(VO12)<20 or M12 is None or 
     if VO12 is None or len(VO12)<20: failed_intraday.append("VIX OHLC 60m → 12H")
     if M12 is None or len(M12)<20: failed_intraday.append(f"{market_name} 60m → 12H")
     if MO12 is None or len(MO12)<20: failed_intraday.append(f"{market_name} OHLC 60m → 12H")
-    st.error("לא הצלחתי לבנות נתוני 12H עבור: " + ", ".join(failed_intraday) + ". בוצעו ניסיונות חוזרים דרך yfinance וגם דרך Yahoo Chart API ישיר.")
-    with st.expander("אבחון מקורות נתונים"):
+    st.error("אין כרגע מספיק נתונים תוך־יומיים לבניית הניתוח. פירוט המקורות מופיע למטה.")
+    with st.expander("אבחון מקורות נתונים", expanded=True):
+        st.write("רכיבים חסרים: " + ", ".join(failed_intraday))
         st.write(f"VIX Close 60m: {source_name(v_intra)} · {len(v_intra) if v_intra is not None else 0} נקודות")
         st.write(f"VIX OHLC 60m: {source_name(vo_intra)} · {len(vo_intra) if vo_intra is not None else 0} נקודות")
         st.write(f"{market_name} 60m: {source_name(m_intra)} · {len(m_intra) if m_intra is not None else 0} נקודות")
         st.write(f"{market_name} OHLC 60m: {source_name(mo_intra)} · {len(mo_intra) if mo_intra is not None else 0} נקודות")
-        st.caption("נתוני 12H הם חלק קריטי מהשיטה, לכן האפליקציה לא מחליפה אותם בנתוני Daily שעלולים לשנות את האות.")
+        for label,frame in [("VIX",vo_intra),(market_name,mo_intra)]:
+            if frame is not None and len(frame):
+                st.code(f"{label}: last={frame.index[-1]} | recent timestamps=" + ", ".join(str(t) for t in frame.index[-8:]),language=None)
+        st.caption("נדרש סיכום סשן מנתונים תוך־יומיים מלאים. המערכת תומכת בחותמות זמן שעתיות שונות ואינה מזיזה נרות או משלימה מחירים חסרים.")
+    st.stop()
+V4=resample_close(v_intra,4)
+M4=resample_close(m_intra,4)
+expected_day=latest_daily_session()
+if (V4 is None or len(V4)<30 or M4 is None
+    or V12.index[-1].tz_localize(None).normalize()<expected_day
+    or M12.index[-1].tz_localize(None).normalize()<expected_day
+    or V4.index[-1] != latest_bucket_start(4,obj=v_intra)
+    or M4.index[-1] != latest_bucket_start(4,obj=m_intra)
+    or V12.index[-1] != latest_bucket_start(12,obj=v_intra)
+    or M12.index[-1] != latest_bucket_start(12,obj=m_intra)
+    or not fresh_history(v_intra,"60m") or not fresh_history(m_intra,"60m")):
+    st.error("ממתינים לנתונים מלאים ומסונכרנים של VIX והמדד. אין איתות כאשר נתוני המקור ישנים או חסרים.")
     st.stop()
 V12_LAST=float(V12.iloc[-1])
 VE9,VE26,CROSS,CROSS_AGE,APPROACH,CROSS_NEAR,GAP=cross_status(V12)
@@ -626,11 +870,12 @@ C1=pctn(v,1); C5=pctn(v,5); R9=V9/V; R3=V/V3
 R1=(V1/V) if np.isfinite(V1) and V>0 else np.nan
 R1_9=(V1/V9) if np.isfinite(V1) and V9>0 else np.nan
 M=float(m.iloc[-1]); M2=pctn(m,2); M5=pctn(m,5)
-DIV4=detect_divergence(resample_close(v_intra,4), lookback=60, pivot=3, min_sep=4, min_price_pct=0.75, min_rsi_delta=4.0, recent_bars=8)
+DIV4=detect_divergence(V4, lookback=60, pivot=3, min_sep=4, min_price_pct=0.75, min_rsi_delta=4.0, recent_bars=8)
 DIV12=detect_divergence(V12, lookback=50, pivot=2, min_sep=3, min_price_pct=1.0, min_rsi_delta=4.0, recent_bars=6)
 SWING12=swing_exhaustion_signal(V12, lookback=50, pivot=2, recent_bars=7, min_swing_pct=1.5, rejection_pct=1.5)
 SR, SUPPORT, RESISTANCE=support_resistance_signal(MO12,44,2)
 VIX_SR, VIX_SUPPORT, VIX_RESISTANCE=support_resistance_signal(VO12,44,2)
+FIB12=smart_fib_state(VO12,lookback=55,pivot=2,min_impulse_pct=7.0)
 
 # Institutional pressure metrics. Use relative/z-score logic rather than fixed raw levels
 # so the model adapts across calm and stressed volatility regimes.
@@ -664,8 +909,8 @@ def addcat(cat,p,t):
 # Divergence is intentionally the dominant signal. Higher-high/lower-low swing
 # structure is scored only after rejection/rebound confirmation, never by itself.
 # -----------------------------------------------------------------------------
-if DIV12=="bullish": addcat("VIX Reversal", 1.90,"VIX 12H Bullish RSI Divergence → VIX UP / Nasdaq SHORT")
-elif DIV12=="bearish": addcat("VIX Reversal",-1.90,"VIX 12H Bearish RSI Divergence → VIX DOWN / Nasdaq LONG")
+if DIV12=="bullish": addcat("VIX Reversal", 1.90,"VIX 12H Bullish RSI Divergence → VIX UP / מדד SHORT")
+elif DIV12=="bearish": addcat("VIX Reversal",-1.90,"VIX 12H Bearish RSI Divergence → VIX DOWN / מדד LONG")
 
 if DIV4=="bullish": addcat("VIX Reversal", 1.00,"VIX 4H Bullish RSI Divergence → SHORT")
 elif DIV4=="bearish": addcat("VIX Reversal",-1.00,"VIX 4H Bearish RSI Divergence → LONG")
@@ -683,6 +928,31 @@ if VIX_SR=="bounce_support": addcat("VIX Reversal", 0.40,"VIX 12H תגובה מ�
 elif VIX_SR=="reject_resistance": addcat("VIX Reversal",-0.40,"VIX 12H דחייה מהתנגדות → LONG")
 elif VIX_SR=="breakout": addcat("VIX Reversal", 0.50,"VIX 12H פריצה מעל התנגדות → SHORT")
 elif VIX_SR=="breakdown": addcat("VIX Reversal",-0.50,"VIX 12H שבירה מתחת לתמיכה → LONG")
+
+# Smart Fib is supportive only. It never scores from location alone: the route to
+# 0.50-0.618 or the reaction from it needs at least two independent confirmations.
+rise_conf=sum([
+    DIV12=="bullish", DIV4=="bullish", VIX_SR in ("breakout","bounce_support"),
+    V12_LAST>VE9, VE9>VE26, len(V4)>=2 and float(V4.iloc[-1])>float(V4.iloc[-2])
+])
+fall_conf=sum([
+    DIV12=="bearish", DIV4=="bearish", VIX_SR in ("breakdown","reject_resistance"),
+    V12_LAST<VE9, VE9<VE26, len(V4)>=2 and float(V4.iloc[-1])<float(V4.iloc[-2])
+])
+if FIB12.get("valid"):
+    fp=FIB12["phase"]
+    if fp=="approaching_up" and rise_conf>=2:
+        addcat("VIX Reversal", 0.45,"Smart Fib: VIX עולה לכיוון 0.50–0.618 + אישורים → SHORT במדד")
+    elif fp=="approaching_down" and fall_conf>=2:
+        addcat("VIX Reversal",-0.45,"Smart Fib: VIX יורד לכיוון 0.50–0.618 + אישורים → LONG במדד")
+    elif fp=="reject_down" and fall_conf>=2:
+        addcat("VIX Reversal",-0.55,"Smart Fib: דחיית VIX מטה מאזור 0.50–0.618 → LONG במדד")
+    elif fp=="rebound_up" and rise_conf>=2:
+        addcat("VIX Reversal", 0.55,"Smart Fib: rebound של VIX מאזור 0.50–0.618 → SHORT במדד")
+    elif fp=="break_above_0618" and rise_conf>=2:
+        addcat("VIX Reversal", 0.55,"Smart Fib: VIX פרץ 0.618 כלפי מעלה + אישורים → המשך SHORT במדד")
+    elif fp=="break_below_0618" and fall_conf>=2:
+        addcat("VIX Reversal",-0.55,"Smart Fib: VIX שבר 0.618 מטה + אישורים → המשך LONG במדד")
 
 # -----------------------------------------------------------------------------
 # 2) INSTITUTIONAL VOLATILITY PRESSURE — 25%
@@ -805,19 +1075,25 @@ elif signed_signal <= -ENTRY_THRESHOLD:
 else:
     state,icon,cls = "WAIT","🟡","yellow"
 
+# Strong labels require the defining reversal evidence.
+if signal_score >= STRONG_THRESHOLD:
+    matching_div = "bullish" if signed_signal > 0 else "bearish"
+    if matching_div not in (DIV4,DIV12):
+        state,icon,cls = "WAIT","🟡","yellow"
+
 # Gauge: -10 = LONG, 0 = neutral, +10 = SHORT.
 pos = max(2, min(98, (signed_signal+10)/20*100))
 if state == "WAIT":
     lean = "SHORT" if signed_signal > 0 else ("LONG" if signed_signal < 0 else "NEUTRAL")
-    score_line = f"Signal Score <b>{signal_score:.1f}/10</b> · נטייה {lean}"
+    score_line = f"עוצמת איתות <b>{signal_score:.1f}/10</b> · נטייה {lean}"
 else:
-    score_line = f"Signal Score <b>{signal_score:.1f}/10</b>"
+    score_line = f"עוצמת איתות <b>{signal_score:.1f}/10</b>"
 
 st.markdown(f"""
 <div class="signal">
   <div class="signal-title {cls}">{icon} {state}</div>
   <div class="score">{score_line}</div>
-  <div class="confidence">כניסה לחיפוש עסקה רק מ־<b>5.0/10</b> · כיסוי נתונים <b>{data_coverage:.0f}%</b></div>
+  <div class="confidence">סף חיפוש עסקה: <b>5.0/10</b> · כיסוי נתונים <b>{data_coverage:.0f}%</b></div>
   <div class="gauge-wrap">
     <div class="pointer" style="left:{pos:.1f}%"></div>
     <div class="gauge"><div class="midline"></div></div>
@@ -826,6 +1102,12 @@ st.markdown(f"""
   </div>
 </div>
 """, unsafe_allow_html=True)
+
+st.caption(f"נתונים יומיים: {v.index[-1]:%d/%m/%Y} · נר סשן אחרון (זמן פתיחה, ניו יורק): {V12.index[-1]:%d/%m %H:%M} · נר 4H: {V4.index[-1]:%d/%m %H:%M}")
+st.caption("הנתונים היומיים מבוססים על הסשן האחרון שנסגר, וממתינים שעה לאחר הסגירה לפרסום. אין כאן מחירי זמן אמת. הציון הוא סכום משקלים, לא אחוז הצלחה. כיסוי הנתונים אינו מדד לאיכות העסקה. אין ביצוע עסקאות אוטומטי.")
+if data_coverage < 100:
+    missing = [name for name,x in [("VVIX",vv),("VIX1D",v1),("SKEW",skew),("COR1M",cor1m)] if x is None]
+    st.warning("כיסוי חלקי — רכיבים חסרים או לא עדכניים: " + ", ".join(missing))
 
 # Top drivers
 top_drivers = sorted(reasons, key=lambda z: abs(z[0]), reverse=True)[:3]
@@ -838,7 +1120,7 @@ for pts, txt, cat in top_drivers:
     )
 if driver_rows:
     st.markdown(
-        '<div class="drivers-card"><div class="drivers-title">Top Drivers</div>' + ''.join(driver_rows) + '</div>',
+        '<div class="drivers-card"><div class="drivers-title">שלושת הגורמים המרכזיים</div>' + ''.join(driver_rows) + '</div>',
         unsafe_allow_html=True
     )
 
@@ -885,6 +1167,24 @@ def swing_text(s):
         "none":("אין אישור","white")
     }.get(s,("אין אישור","white"))
 
+def fib_text(f):
+    if not f.get("valid"):
+        return "אין Impulse ברור","white"
+    p=f["phase"]
+    mapping={
+        "approaching_up":("VIX בדרך לאזור → SHORT Watch","orange"),
+        "approaching_down":("VIX בדרך לאזור → LONG Watch","blue"),
+        "decision_zone":("0.50–0.618 · DECISION ZONE","yellow"),
+        "reject_down":("דחייה מטה מהאזור → LONG","green"),
+        "rebound_up":("Rebound מהאזור → SHORT","red"),
+        "break_above_0618":("פריצה מעל 0.618 → SHORT","red"),
+        "break_below_0618":("שבירה מתחת 0.618 → LONG","green"),
+        "below_zone":("מתחת לאזור · ממתין למומנטום","white"),
+        "above_zone":("מעל לאזור · ממתין למומנטום","white"),
+        "tracking":("מעקב","white"),
+    }
+    return mapping.get(p,(p,"white"))
+
 def institutional_text(v):
     if v>=0.45: return f"Pressure {v:+.2f}/2.5 → SHORT","red"
     if v<=-0.45: return f"Relief {v:+.2f}/2.5 → LONG","green"
@@ -892,6 +1192,7 @@ def institutional_text(v):
 
 d4,d4c=div_text(DIV4); d12,d12c=div_text(DIV12); srt,src=sr_text(SR); vsrt,vsrc=vix_sr_text(VIX_SR)
 swingt,swingc=swing_text(SWING12); instt,instc=institutional_text(category_scores["Institutional"])
+fibt,fibc=fib_text(FIB12)
 term_text="Risk-Off" if R3>=1.02 else ("Risk-On" if R3<=0.94 else "ניטרלי")
 term_cls="red" if R3>=1.02 else ("green" if R3<=0.94 else "white")
 
@@ -899,6 +1200,7 @@ st.markdown('<div class="status-grid">'+
     status_row("Divergence 12H · HIGH WEIGHT",d12,d12c)+
     status_row("Divergence 4H",d4,d4c)+
     status_row("VIX Swing Structure · 12H",swingt,swingc)+
+    status_row("Smart Fib 0.50–0.618 · 12H",fibt,fibc)+
     status_row("Institutional Vol Pressure",instt,instc)+
     status_row("VIX S/R · 12H",vsrt,vsrc)+
     status_row(f"{market_name} S/R · 12H",srt,src)+
@@ -908,15 +1210,28 @@ st.markdown('<div class="status-grid">'+
     status_row("Cross · EMA9/26",cross_text,cross_cls)+
     '</div>',unsafe_allow_html=True)
 
+# Smart Fib detail panel
+if FIB12.get("valid"):
+    arrow="↓" if FIB12["direction"]=="down" else "↑"
+    st.markdown(
+        f'<div class="panel"><b>Smart Fib 12H {arrow}</b><br>'
+        f'Impulse: <bdi dir="ltr">{FIB12["start"]:.2f} → {FIB12["end"]:.2f}</bdi> · '
+        f'אזור החלטה <bdi dir="ltr">0.50–0.618 = {FIB12["zone_low"]:.2f}–{FIB12["zone_high"]:.2f}</bdi><br>'
+        f'VIX נוכחי <bdi dir="ltr">{FIB12["current"]:.2f}</bdi> · {fibt} · '
+        f'אישורי עלייה <bdi dir="ltr">{rise_conf}/6</bdi> · אישורי ירידה <bdi dir="ltr">{fall_conf}/6</bdi><br>'
+        '<span class="muted">הפיבונאצ׳י הוא אזור יעד/תגובה בלבד. ניקוד ניתן רק עם לפחות 2 אישורים נוספים.</span></div>',
+        unsafe_allow_html=True
+    )
+
 # Minimal execution reminder
-if "SHORT" in state: action="חפש טריגר SHORT ב-1H"
-elif "LONG" in state: action="חפש טריגר LONG ב-1H"
+if "SHORT" in state: action="חפש אישור SHORT במדד שנבחר; זה אינו אישור כניסה אוטומטי"
+elif "LONG" in state: action="חפש אישור LONG במדד שנבחר; זה אינו אישור כניסה אוטומטי"
 else: action="אין עסקה — המתן לסנכרון"
 st.markdown(f'<div class="panel" style="text-align:center;font-weight:900">{action}</div>',unsafe_allow_html=True)
 
 with st.expander("פירוט החישוב"):
-    st.write("**משקלי המודל:** VIX Divergence/Structure 45% · Institutional Vol 25% · Vol Curve 15% · Market Confirmation 10% · EMA9/26 5%")
-    st.caption("כיול סופי: מומנטום Nasdaq הונמך לאחר בק־טסט; Higher High + rejection ב־VIX קיבל משקל גדול יותר מ־Lower Low + rebound; Swing דורש כעת תנועה ואישור של 1.5% לפחות.")
+    st.write("**תקרות משקל בקירוב (לא אחוזי הצלחה):** VIX Divergence/Structure + Smart Fib ~45–50% · Institutional Vol 25% · Vol Curve 15% · Market Confirmation 10% · EMA9/26 5%")
+    st.caption("Smart Fib נוסף כרכיב תומך בלבד (עד ±0.55) ודורש לפחות שני אישורים נוספים. אין כאן טענה לרווחיות או לכיול אופטימלי ללא בק־טסט/Forward Test ייעודי.")
     st.write(f"VIX 12H {V12_LAST:.2f} · EMA9 {VE9:.2f} · EMA26 {VE26:.2f} · Cross proximity {CROSS_NEAR}/10")
     st.write(f"Divergence: 4H={DIV4} · 12H={DIV12} · Swing 12H={SWING12}")
     st.write(f"VIX 1D {C1:+.2f}% · 5D {C5:+.2f}% · VIX9D/VIX {R9:.3f} · VIX/VIX3M {R3:.3f}")
@@ -930,9 +1245,11 @@ with st.expander("פירוט החישוב"):
         st.write(f"COR1M {COR1M:.2f} · 5D {COR5:+.2f}% · z-score {COR_Z:+.2f}")
     st.write(f"{market_name}: מומנטום 2D {M2:+.2f}% · 5D {M5:+.2f}% · S/R 12H: {SR} · תמיכה {SUPPORT:.2f} · התנגדות {RESISTANCE:.2f}")
     st.write(f"VIX S/R 12H: {VIX_SR} · תמיכה {VIX_SUPPORT:.2f} · התנגדות {VIX_RESISTANCE:.2f}")
+    if FIB12.get("valid"):
+        st.write(f"Smart Fib 12H: direction={FIB12['direction']} · phase={FIB12['phase']} · anchor {FIB12['start']:.2f}→{FIB12['end']:.2f} · zone {FIB12['zone_low']:.2f}–{FIB12['zone_high']:.2f} · rise_conf={rise_conf}/6 · fall_conf={fall_conf}/6")
     st.write(f"כיסוי נתונים: {data_coverage:.0f}% · Institutional availability {institutional_available:.1f}/{institutional_total:.1f}")
     st.write("RSI עצמו אינו מקבל נקודות. רק Divergence מאומת מקבל משקל, כדי להימנע מ-RSI overbought/oversold פשוט שעלול להטעות ב-VIX.")
-    st.write(f"ציון משוקלל נטו: {score:+.2f} → Signal Score {signal_score:.2f}/10 · כיוון: {'SHORT' if signed_signal>0 else ('LONG' if signed_signal<0 else 'NEUTRAL')}")
+    st.write(f"ציון משוקלל נטו: {score:+.2f} → עוצמת איתות {signal_score:.2f}/10 · כיוון: {'SHORT' if signed_signal>0 else ('LONG' if signed_signal<0 else 'NEUTRAL')}")
     st.write("**ציוני קטגוריות:** " + " · ".join([f"{k}: {v:+.2f}" for k,v in category_scores.items()]))
     for pts,txt,cat in sorted(reasons,key=lambda z:abs(z[0]),reverse=True):
         st.write(f"**{pts:+.2f}** — {txt}  ·  _{cat}_")
@@ -951,4 +1268,4 @@ with st.expander("מקורות נתונים / גיבוי"):
     st.write(f"{market_name} 60m: **{source_name(m_intra)}**")
     st.caption("גיבוי אמיתי: Yahoo/yfinance → Yahoo Chart API ישיר → Cboe הרשמי למדדי תנודתיות/אופציות. FRED משמש ל-VIX/VIX3M במידת הצורך, ו-Stooq למדדי NDX/SPX. רכיב Institutional הוא אופציונלי: מקור חסר מוריד Data Coverage ואינו מוחלף בנתון מומצא.")
 
-st.caption(f"עודכן {datetime.now().strftime('%H:%M')} · v10.5 Final Calibrated · Multi-Source + Retry פעיל · כלי מחקרי, לא ייעוץ השקעות")
+st.caption(f"עודכן {pd.Timestamp.now(tz='Asia/Jerusalem').strftime('%H:%M')} · v10.7 Smart Fib · שעון ישראל · Multi-Source + Retry פעיל · כלי מחקרי, לא ייעוץ השקעות")
