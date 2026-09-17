@@ -255,7 +255,7 @@ html,body,[class*="css"]{background:var(--bg);color:var(--txt)}
 
 DATA_TIMEOUT = 8
 HTTP_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (VIX-Tactical/10.8; Streamlit)",
+    "User-Agent": "Mozilla/5.0 (VIX-Tactical/11.0; Streamlit)",
     "Accept": "application/json,text/csv,*/*",
 }
 
@@ -268,6 +268,9 @@ CBOE_SYMBOLS = {
     "^VIX1D": "VIX1D",
     "^SKEW": "SKEW",
     "^COR1M": "COR1M",
+    "^VIX6M": "VIX6M",
+    "^VIX1Y": "VIX1Y",
+    "DSPX": "DSPX",
 }
 
 def _mark_source(obj, source):
@@ -852,7 +855,7 @@ def detect_clear_pattern(df, lookback=42, pivot=2):
 def status_row(name,value,cls="white"):
     return f'<div class="status"><div class="status-name"><bdi>{name}</bdi></div><div class="status-val {cls}"><bdi>{value}</bdi></div></div>'
 
-st.markdown('<div class="hero"><div class="hero-title">🎯 VIX Tactical</div><div class="muted">עסקאות קצרות · 1H טריגר · 4H אישור · 12H כיוון/בונוס · v10.10</div></div>',unsafe_allow_html=True)
+st.markdown('<div class="hero"><div class="hero-title">🎯 VIX Tactical</div><div class="muted">עסקאות קצרות · 1H טריגר · 4H אישור · 12H כיוון/בונוס · v11.0</div></div>',unsafe_allow_html=True)
 if st.button("🔄 רענן",use_container_width=True): st.cache_data.clear(); st.rerun()
 
 st.markdown('<div class="panel" dir="rtl"><bdi dir="ltr">LONG</bdi> — חיפוש עלייה ב-QQQ/Nasdaq · <bdi dir="ltr">SHORT</bdi> — חיפוש ירידה ב-QQQ/Nasdaq<br><span class="muted">אין יותר ניקוד או אישור מה-Nasdaq/S&P עצמם. הכיוון נגזר מה-VIX בלבד.</span></div>', unsafe_allow_html=True)
@@ -869,12 +872,16 @@ with st.spinner("בודק נתוני VIX ומחשב… מקור שאינו מג�
     v1=fetch_close("^VIX1D",period="6mo")
     skew=fetch_close("^SKEW",period="6mo")
     cor1m=fetch_close("^COR1M",period="6mo")
+    v6=fetch_close("^VIX6M",period="6mo")
+    v1y=fetch_close("^VIX1Y",period="6mo")
+    dspx=fetch_close("DSPX",period="6mo")
 
 # Revalidate cached frames as the session changes.
 v, v9, v3, vv, v1, skew, cor1m = [
     x if _valid_history(x,"6mo","1d") else None
     for x in (v,v9,v3,vv,v1,skew,cor1m)
 ]
+v6, v1y, dspx = [x if _valid_history(x,"6mo","1d") else None for x in (v6,v1y,dspx)]
 required_daily = {"VIX":v,"VIX9D":v9,"VIX3M":v3}
 failed_daily=[name for name,x in required_daily.items() if x is None or len(x)<30]
 if failed_daily:
@@ -889,6 +896,9 @@ V=float(v.iloc[-1]); V9=float(v9.iloc[-1]); V3=float(v3.iloc[-1]); VV=float(vv.i
 V1=float(v1.iloc[-1]) if v1 is not None and len(v1) else np.nan
 SKEW=float(skew.iloc[-1]) if skew is not None and len(skew) else np.nan
 COR1M=float(cor1m.iloc[-1]) if cor1m is not None and len(cor1m) else np.nan
+V6=float(v6.iloc[-1]) if v6 is not None and len(v6) else np.nan
+V1Y=float(v1y.iloc[-1]) if v1y is not None and len(v1y) else np.nan
+DSPX=float(dspx.iloc[-1]) if dspx is not None and len(dspx) else np.nan
 
 VO1H=closed_session_hourly(vo_intra)
 V1H=VO1H["Close"] if VO1H is not None else None
@@ -903,6 +913,28 @@ if (V1H is None or len(V1H)<35 or VO1H is None or len(VO1H)<35 or V4 is None or 
 C1=pctn(v,1); C5=pctn(v,5); R9=V9/V; R3=V/V3
 R1=(V1/V) if np.isfinite(V1) and V>0 else np.nan
 R1_9=(V1/V9) if np.isfinite(V1) and V9>0 else np.nan
+R3_6=(V3/V6) if np.isfinite(V6) and V6>0 else np.nan
+R6_1Y=(V6/V1Y) if np.isfinite(V6) and np.isfinite(V1Y) and V1Y>0 else np.nan
+
+# Regime engine: slow curve context is not a trigger, but it changes how much confidence
+# we place in mean-reversion versus persistence at the front end.
+def volatility_regime(vix, r9, r3, r36=np.nan):
+    stress = 0
+    if vix >= 25: stress += 2
+    elif vix >= 20: stress += 1
+    elif vix < 15: stress -= 1
+    if r9 >= 1.03: stress += 2
+    elif r9 <= 0.97: stress -= 1
+    if r3 >= 1.02: stress += 2
+    elif r3 <= 0.94: stress -= 1
+    if np.isfinite(r36):
+        if r36 >= 1.01: stress += 1
+        elif r36 <= 0.96: stress -= 1
+    if stress >= 4: return "STRESS", stress
+    if stress <= -2: return "CALM", stress
+    return "TRANSITION", stress
+
+REGIME, REGIME_SCORE = volatility_regime(V,R9,R3,R3_6)
 
 # Short-trade divergence hierarchy: 1H trigger + 4H main confirmation + 12H bonus.
 DIV1=detect_divergence(V1H, lookback=72, pivot=3, min_sep=4, min_price_pct=0.55, min_rsi_delta=3.5, recent_bars=10)
@@ -949,7 +981,7 @@ SKEW_Z=rolling_zscore_last(skew,60) if skew is not None else np.nan
 COR5=pctn(cor1m,5) if cor1m is not None else np.nan
 COR_Z=rolling_zscore_last(cor1m,60) if cor1m is not None else np.nan
 
-# v10.10 Fast Pressure: emphasize *change/acceleration* in the front end.
+# v11.0 Volatility Intelligence: emphasize *change/acceleration* in the front end.
 VV1=pctn(vv,1) if vv is not None else np.nan
 VV3=pctn(vv,3) if vv is not None else np.nan
 VIX1=pctn(v,1) if v is not None else np.nan
@@ -962,8 +994,14 @@ FRONT_NOW=float(FRONT_RATIO.iloc[-1]) if FRONT_RATIO is not None and len(FRONT_R
 FRONT_PREV=float(FRONT_RATIO.iloc[-2]) if FRONT_RATIO is not None and len(FRONT_RATIO)>=2 else np.nan
 FRONT_DELTA=((FRONT_NOW/FRONT_PREV)-1.0)*100 if np.isfinite(FRONT_NOW) and np.isfinite(FRONT_PREV) and FRONT_PREV!=0 else np.nan
 
+# Realized VIX motion diagnostics from closed 1H bars: acceleration / shock persistence.
+_v1h_ret = pd.to_numeric(V1H, errors="coerce").pct_change().dropna()*100 if V1H is not None else pd.Series(dtype=float)
+VIX_RV_6H=float(_v1h_ret.iloc[-6:].std(ddof=0)*np.sqrt(6)) if len(_v1h_ret)>=6 else np.nan
+VIX_RV_24H=float(_v1h_ret.iloc[-24:].std(ddof=0)*np.sqrt(24)) if len(_v1h_ret)>=24 else np.nan
+VIX_RV_RATIO=(VIX_RV_6H/VIX_RV_24H) if np.isfinite(VIX_RV_6H) and np.isfinite(VIX_RV_24H) and VIX_RV_24H>0 else np.nan
+
 score=0.0; reasons=[]
-category_scores={"VIX Tactical":0.0,"Institutional":0.0,"Vol Curve":0.0}
+category_scores={"VIX Tactical":0.0,"Institutional":0.0,"Vol Curve":0.0,"Regime":0.0}
 
 def addcat(cat,p,t):
     global score
@@ -1133,6 +1171,30 @@ elif C1<=-3 or C5<=-4: addcat("Vol Curve",-0.25,"VIX impulse מטה")
 if V>=30: addcat("Vol Curve", 0.10,"VIX ≥30")
 elif V<15: addcat("Vol Curve",-0.10,"VIX <15")
 
+# -----------------------------------------------------------------------------
+# 4) VOLATILITY INTELLIGENCE / REGIME — confirmation, never a standalone entry.
+# Front-end slope gets priority; longer curve and intraday VIX realized motion prevent
+# a reversal setup from fighting an accelerating stress regime blindly.
+# -----------------------------------------------------------------------------
+if REGIME=="STRESS": addcat("Regime",0.35,"Stress regime: עקומת התנודתיות תומכת בהתמדה של VIX / SHORT context")
+elif REGIME=="CALM": addcat("Regime",-0.25,"Calm regime: מבנה התנודתיות תומך יותר ב-Vol Relief / LONG context")
+
+if np.isfinite(R3_6):
+    if R3_6>=1.01: addcat("Regime",0.20,"VIX3M/VIX6M inverted → stress extends beyond front end")
+    elif R3_6<=0.96: addcat("Regime",-0.15,"VIX3M/VIX6M steep contango → calmer medium-term curve")
+
+if np.isfinite(VIX_RV_RATIO):
+    if VIX_RV_RATIO>=1.35 and C1>0: addcat("Regime",0.30,"VIX intraday realized-vol acceleration upward → SHORT confirmation")
+    elif VIX_RV_RATIO>=1.35 and C1<0: addcat("Regime",-0.30,"VIX intraday realized-vol acceleration downward → LONG confirmation")
+
+# Optional dispersion context. It is deliberately tiny: dispersion is useful for
+# separating index-wide fear from stock-specific volatility, not for timing by itself.
+DSPX5=pctn(dspx,5) if dspx is not None else np.nan
+if np.isfinite(DSPX5) and np.isfinite(C5):
+    spread_move=C5-DSPX5
+    if spread_move>=5.0: addcat("Regime",0.15,"Index vol outruns dispersion → more systemic stress / SHORT context")
+    elif spread_move<=-5.0: addcat("Regime",-0.15,"Dispersion outruns index vol → less systemic VIX pressure / LONG context")
+
 # Public-source data coverage. Core tactical model = 75%; institutional layer = 25%.
 data_coverage = 75.0 + 25.0 * (institutional_available / institutional_total)
 
@@ -1141,6 +1203,16 @@ signal_score=abs(signed_signal)
 ENTRY_THRESHOLD=4.0
 STRONG_THRESHOLD=6.5
 VERY_STRONG_THRESHOLD=8.0
+
+# Conflict gate: a high raw score is not enough if the tactical core and fast institutional
+# pressure point in opposite directions. This reduces false confidence in scalp entries.
+tactical_score=category_scores["VIX Tactical"]
+fast_score=category_scores["Institutional"]
+core_conflict = (tactical_score*fast_score < 0 and abs(tactical_score)>=2.0 and abs(fast_score)>=0.75)
+if core_conflict:
+    signed_signal *= 0.72
+    signal_score=abs(signed_signal)
+    reasons.append((0.0,"⚠️ Conflict Gate: Tactical vs Fast Pressure disagree → confidence reduced","Regime"))
 
 if signed_signal >= VERY_STRONG_THRESHOLD: state,icon,cls="VERY STRONG SHORT","🔴","red"
 elif signed_signal >= STRONG_THRESHOLD: state,icon,cls="STRONG SHORT","🔴","red"
@@ -1237,6 +1309,8 @@ sr4t,sr4c=srzone_text(SR4); sr12t,sr12c=srzone_text(SR12)
 instt,instc=institutional_text(category_scores["Institutional"])
 term_text="Risk-Off" if R3>=1.02 else ("Risk-On" if R3<=0.94 else "ניטרלי")
 term_cls="red" if R3>=1.02 else ("green" if R3<=0.94 else "white")
+regime_cls="red" if REGIME=="STRESS" else ("green" if REGIME=="CALM" else "yellow")
+rv_text=(f"Acceleration {VIX_RV_RATIO:.2f}x" if np.isfinite(VIX_RV_RATIO) else "N/A")
 
 st.markdown('<div class="status-grid">'+
     status_row("Divergence 1H · FAST TRIGGER",d1,d1c)+
@@ -1248,7 +1322,9 @@ st.markdown('<div class="status-grid">'+
     status_row("Smart Fib · 4H",f4t,f4c)+
     status_row("Repeated S/R · 12H",sr12t,sr12c)+
     status_row("Smart Fib · 12H",f12t,f12c)+
-    status_row("Institutional Vol Pressure",instt,instc)+
+    status_row("Institutional Fast Pressure",instt,instc)+
+    status_row("Volatility Regime",REGIME,regime_cls)+
+    status_row("VIX Intraday RV",rv_text,"orange" if np.isfinite(VIX_RV_RATIO) and VIX_RV_RATIO>=1.35 else "white")+
     status_row("Term Structure",term_text,term_cls)+
     status_row("VIX9D / VIX",("לחץ" if R9>=1.03 else ("רגוע" if R9<=0.97 else "מאוזן")),"red" if R9>=1.03 else ("green" if R9<=0.97 else "white"))+
     '</div>',unsafe_allow_html=True)
@@ -1267,14 +1343,18 @@ else: action="אין עסקה — המתן לסנכרון"
 st.markdown(f'<div class="panel" style="text-align:center;font-weight:900">{action}</div>',unsafe_allow_html=True)
 
 with st.expander("פירוט החישוב"):
-    st.write("**מבנה המשקל החדש:** Divergence 1H+4H הוא הליבה; 12H בונוס. Fib נבדק ב-4H/12H ורק עם אישורים. תבניות W/M/יתד נבדקות ב-1H/4H. אין יותר Market Confirmation ואין EMA.")
+    st.write("**מבנה v11.0:** Divergence 1H+4H הוא הליבה; 12H בונוס. Fib נבדק ב-4H/12H ורק עם אישורים. תבניות W/M/יתד נבדקות ב-1H/4H. אין יותר Market Confirmation ואין EMA.")
     st.write(f"Divergence: 1H={DIV1} · 4H={DIV4} · 12H={DIV12}")
     st.write(f"Pattern: 1H={PAT1['pattern']} ({PAT1['bias']}) · 4H={PAT4['pattern']} ({PAT4['bias']})")
     st.write(f"Repeated S/R 4H: {SR4['state']} · support touches={SR4['support_touches']} · resistance touches={SR4['resistance_touches']}")
     st.write(f"Repeated S/R 12H: {SR12['state']} · support touches={SR12['support_touches']} · resistance touches={SR12['resistance_touches']}")
     if FIB4.get('valid'): st.write(f"Smart Fib 4H: {FIB4['direction']} · {FIB4['phase']} · zone {FIB4['zone_low']:.2f}–{FIB4['zone_high']:.2f}")
     if FIB12.get('valid'): st.write(f"Smart Fib 12H: {FIB12['direction']} · {FIB12['phase']} · zone {FIB12['zone_low']:.2f}–{FIB12['zone_high']:.2f}")
-    st.write(f"VIX 1D {C1:+.2f}% · 5D {C5:+.2f}% · VIX9D/VIX {R9:.3f} · VIX/VIX3M {R3:.3f}")
+    st.write(f"VIX 1D {C1:+.2f}% · 5D {C5:+.2f}% · VIX9D/VIX {R9:.3f} · VIX/VIX3M {R3:.3f} · Regime {REGIME}")
+    if np.isfinite(V6): st.write(f"VIX6M {V6:.2f} · VIX3M/VIX6M {R3_6:.3f}")
+    if np.isfinite(V1Y): st.write(f"VIX1Y {V1Y:.2f} · VIX6M/VIX1Y {R6_1Y:.3f}")
+    if np.isfinite(VIX_RV_RATIO): st.write(f"VIX intraday RV acceleration {VIX_RV_RATIO:.2f}x")
+    if np.isfinite(DSPX): st.write(f"DSPX {DSPX:.2f} · 5D {DSPX5:+.2f}%")
     if np.isfinite(V1): st.write(f"VIX1D {V1:.2f} · VIX1D/VIX {R1:.3f} · VIX1D/VIX9D {R1_9:.3f}")
     if np.isfinite(VV): st.write(f"VVIX {VV:.2f} · VVIX/VIX z-score {VV_Z:+.2f} · Relative 5D momentum {VV_REL:+.2f}pp")
     if np.isfinite(SKEW): st.write(f"SKEW {SKEW:.2f} · 5D {SKEW5:+.2f}% · z-score {SKEW_Z:+.2f}")
@@ -1292,8 +1372,11 @@ with st.expander("מקורות נתונים / גיבוי"):
     st.write(f"VIX1D Daily: **{source_name(v1)}**")
     st.write(f"SKEW Daily: **{source_name(skew)}**")
     st.write(f"COR1M Daily: **{source_name(cor1m)}**")
+    st.write(f"VIX6M Daily: **{source_name(v6)}**")
+    st.write(f"VIX1Y Daily: **{source_name(v1y)}**")
+    st.write(f"DSPX Daily: **{source_name(dspx)}**")
     st.write(f"VIX Close 60m: **{source_name(v_intra)}**")
     st.write(f"VIX OHLC 60m: **{source_name(vo_intra)}**")
     st.caption("גיבוי אמיתי: Yahoo/yfinance → Yahoo Chart API ישיר → Cboe הרשמי למדדי תנודתיות/אופציות. FRED משמש ל-VIX/VIX3M במידת הצורך. רכיב Institutional הוא אופציונלי: מקור חסר מוריד Data Coverage ואינו מוחלף בנתון מומצא.")
 
-st.caption(f"עודכן {pd.Timestamp.now(tz='Asia/Jerusalem').strftime('%H:%M')} · v10.10 Fast Pressure · שעון ישראל · Multi-Source + Retry פעיל · כלי מחקרי, לא ייעוץ השקעות")
+st.caption(f"עודכן {pd.Timestamp.now(tz='Asia/Jerusalem').strftime('%H:%M')} · v11.0 Volatility Intelligence · שעון ישראל · Multi-Source + Retry פעיל · כלי מחקרי, לא ייעוץ השקעות")
