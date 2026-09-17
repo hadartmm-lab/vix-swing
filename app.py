@@ -739,7 +739,9 @@ def smart_fib_state(df, lookback=55, pivot=2, min_impulse_pct=7.0):
         elif cur <= zone_high+tol:
             phase='reject_down' if touched and cur<prev and mom<0 else 'decision_zone'
         else:
-            phase='break_above_0618' if cur>zone_high+break_buf else 'above_zone'
+            # A move beyond 0.618 is NOT an entry by itself. It means the correction
+            # has gone deeper; wait to see whether the old downtrend resumes.
+            phase='deep_retracement_up'
     else:
         touched=float(recent['Low'].min()) <= zone_high+tol
         if cur > zone_high+tol:
@@ -747,7 +749,9 @@ def smart_fib_state(df, lookback=55, pivot=2, min_impulse_pct=7.0):
         elif cur >= zone_low-tol:
             phase='rebound_up' if touched and cur>prev and mom>0 else 'decision_zone'
         else:
-            phase='break_below_0618' if cur<zone_low-break_buf else 'below_zone'
+            # A move beyond 0.618 is NOT an entry by itself. It means the correction
+            # has gone deeper; wait to see whether the old uptrend resumes.
+            phase='deep_retracement_down'
     if cur<zone_low: dist=(zone_low-cur)/cur*100
     elif cur>zone_high: dist=(cur-zone_high)/cur*100
     else: dist=0.0
@@ -855,7 +859,7 @@ def detect_clear_pattern(df, lookback=42, pivot=2):
 def status_row(name,value,cls="white"):
     return f'<div class="status"><div class="status-name"><bdi>{name}</bdi></div><div class="status-val {cls}"><bdi>{value}</bdi></div></div>'
 
-st.markdown('<div class="hero"><div class="hero-title">🎯 VIX Tactical</div><div class="muted">עסקאות קצרות · 1H טריגר · 4H אישור · 12H כיוון/בונוס · v11.0</div></div>',unsafe_allow_html=True)
+st.markdown('<div class="hero"><div class="hero-title">🎯 VIX Tactical</div><div class="muted">עסקאות קצרות · 1H טריגר · 4H אישור · 12H כיוון/בונוס · v11.1</div></div>',unsafe_allow_html=True)
 if st.button("🔄 רענן",use_container_width=True): st.cache_data.clear(); st.rerun()
 
 st.markdown('<div class="panel" dir="rtl"><bdi dir="ltr">LONG</bdi> — חיפוש עלייה ב-QQQ/Nasdaq · <bdi dir="ltr">SHORT</bdi> — חיפוש ירידה ב-QQQ/Nasdaq<br><span class="muted">אין יותר ניקוד או אישור מה-Nasdaq/S&P עצמם. הכיוון נגזר מה-VIX בלבד.</span></div>', unsafe_allow_html=True)
@@ -981,7 +985,7 @@ SKEW_Z=rolling_zscore_last(skew,60) if skew is not None else np.nan
 COR5=pctn(cor1m,5) if cor1m is not None else np.nan
 COR_Z=rolling_zscore_last(cor1m,60) if cor1m is not None else np.nan
 
-# v11.0 Volatility Intelligence: emphasize *change/acceleration* in the front end.
+# v11.1 Precision Continuation: emphasize *change/acceleration* in the front end.
 VV1=pctn(vv,1) if vv is not None else np.nan
 VV3=pctn(vv,3) if vv is not None else np.nan
 VIX1=pctn(v,1) if v is not None else np.nan
@@ -1060,15 +1064,23 @@ def fib_repeated_level_overlap(f,z):
     return bool(touches>=3 and np.isfinite(level) and f['zone_low']-pad<=level<=f['zone_high']+pad)
 
 def score_fib(f,z,tf,base,react):
+    # Fibonacci is a LOCATION + CONTINUATION tool:
+    # impulse -> correction into 0.50-0.618 -> reaction back toward the OLD trend.
+    # Crossing 0.618 never scores as a breakout signal.
     if not f.get('valid') or not fib_repeated_level_overlap(f,z): return
     fp=f['phase']; rise=fib_confirmation_count('up'); fall=fib_confirmation_count('down')
-    if fp=='approaching_up' and rise>=1: addcat("VIX Tactical", base,f"Smart Fib {tf} + התנגדות רב-נגיעות: VIX עולה לאזור → SHORT Watch")
-    elif fp=='approaching_down' and fall>=1: addcat("VIX Tactical",-base,f"Smart Fib {tf} + תמיכה רב-נגיעות: VIX יורד לאזור → LONG Watch")
-    elif fp in ('rebound_up','break_above_0618') and rise>=1: addcat("VIX Tactical", react,f"Smart Fib {tf} + S/R רב-נגיעות: תגובה שורית ב-VIX → SHORT")
-    elif fp in ('reject_down','break_below_0618') and fall>=1: addcat("VIX Tactical",-react,f"Smart Fib {tf} + S/R רב-נגיעות: תגובה דובית ב-VIX → LONG")
+    if fp=='approaching_up' and fall>=1:
+        addcat("VIX Tactical",-base,f"Smart Fib {tf}: תיקון עולה אל 0.50–0.618 בתוך Impulse יורד → Watch LONG אם המגמה הישנה חוזרת")
+    elif fp=='approaching_down' and rise>=1:
+        addcat("VIX Tactical", base,f"Smart Fib {tf}: תיקון יורד אל 0.50–0.618 בתוך Impulse עולה → Watch SHORT אם המגמה הישנה חוזרת")
+    elif fp=='reject_down' and fall>=1:
+        addcat("VIX Tactical",-react,f"Smart Fib {tf}: נגיעה/תיקון + דחייה מטה → חזרה למגמת VIX היורדת / LONG")
+    elif fp=='rebound_up' and rise>=1:
+        addcat("VIX Tactical", react,f"Smart Fib {tf}: נגיעה/תיקון + חזרה מעלה → חזרה למגמת VIX העולה / SHORT")
+    # deep_retracement_* is context only: no points until continuation is confirmed.
 
 score_fib(FIB4,SR4,'4H',0.45,0.75)
-score_fib(FIB12,SR12,'12H',0.25,0.45)
+score_fib(FIB12,SR12,'12H',0.15,0.25)
 
 # Reference Setup inherited from v10.9: complete 4H scalp setup can stand on its own.
 def fib_is_confirmed_for(direction):
@@ -1076,16 +1088,16 @@ def fib_is_confirmed_for(direction):
         return False
     phase = FIB4.get("phase")
     if direction == "down":
-        return phase in ("reject_down","break_below_0618")
-    return phase in ("rebound_up","break_above_0618")
+        return phase == "reject_down"
+    return phase == "rebound_up"
 
 ref_long = DIV4=="bearish" and PAT4.get("bias")=="bearish" and fib_is_confirmed_for("down")
 ref_short = DIV4=="bullish" and PAT4.get("bias")=="bullish" and fib_is_confirmed_for("up")
 
 if ref_long:
-    addcat("VIX Tactical",-1.20,"🔥 4H REFERENCE SETUP: Bearish Divergence + יתד/M + Fib 0.50–0.618 ב-S/R + דחייה/שבירה → LONG חזק")
+    addcat("VIX Tactical",-1.20,"🔥 4H REFERENCE SETUP: Bearish Divergence + יתד/M + Fib 0.50–0.618 ב-S/R + חזרה למגמת VIX היורדת → LONG חזק")
 elif ref_short:
-    addcat("VIX Tactical", 1.20,"🔥 4H REFERENCE SETUP: Bullish Divergence + יתד/W + Fib 0.50–0.618 ב-S/R + תגובה/פריצה → SHORT חזק")
+    addcat("VIX Tactical", 1.20,"🔥 4H REFERENCE SETUP: Bullish Divergence + יתד/W + Fib 0.50–0.618 ב-S/R + חזרה למגמת VIX העולה → SHORT חזק")
 
 
 # -----------------------------------------------------------------------------
@@ -1214,6 +1226,17 @@ if core_conflict:
     signal_score=abs(signed_signal)
     reasons.append((0.0,"⚠️ Conflict Gate: Tactical vs Fast Pressure disagree → confidence reduced","Regime"))
 
+
+# Human-readable confluence/conflict summary for fast scanning.
+if core_conflict:
+    conflict_text = "⚠️ MIXED — Tactical Core ו-Fast Pressure בכיוונים מנוגדים"
+    conflict_cls = "yellow"
+elif abs(tactical_score) < 2.0 and abs(fast_score) >= 0.45:
+    conflict_text = "רקע מוסדי בלבד — אין עדיין 4H Setup"
+    conflict_cls = "yellow"
+else:
+    conflict_text = "מסונכרן / ללא קונפליקט מהותי"
+    conflict_cls = "green" if abs(tactical_score)>=2.0 else "white"
 if signed_signal >= VERY_STRONG_THRESHOLD: state,icon,cls="VERY STRONG SHORT","🔴","red"
 elif signed_signal >= STRONG_THRESHOLD: state,icon,cls="STRONG SHORT","🔴","red"
 elif signed_signal >= ENTRY_THRESHOLD: state,icon,cls="SHORT","🟠","orange"
@@ -1249,7 +1272,30 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
+
+# Freshness diagnostic: highlights unusually old derived bars.
+def freshness_label(idx, hours):
+    try:
+        ts=pd.Timestamp(idx[-1])
+        now=pd.Timestamp.now(tz=ts.tz) if getattr(ts, "tzinfo", None) is not None else pd.Timestamp.now()
+        age=(now-ts).total_seconds()/3600.0
+        # generous tolerance for market closures/weekends; informational only.
+        stale = age > hours
+        return age, stale
+    except Exception:
+        return np.nan, False
+
+age1,stale1=freshness_label(V1H.index,8)
+age4,stale4=freshness_label(V4.index,16)
+age12,stale12=freshness_label(V12.index,28)
 st.caption(f"Last data update · VIX Daily: {v.index[-1]:%d/%m/%Y} · 1H: {V1H.index[-1]:%d/%m %H:%M} · 4H: {V4.index[-1]:%d/%m %H:%M} · 12H: {V12.index[-1]:%d/%m %H:%M}")
+
+if stale1 or stale4 or stale12:
+    stale_parts=[]
+    if stale1: stale_parts.append(f"1H ~{age1:.0f}h")
+    if stale4: stale_parts.append(f"4H ~{age4:.0f}h")
+    if stale12: stale_parts.append(f"12H ~{age12:.0f}h")
+    st.warning("⚠️ Freshness: ייתכן שחלק מהברים ישנים: " + " · ".join(stale_parts) + ". בזמן סגירת שוק זה יכול להיות תקין; לפני עסקה יש לרענן ולאמת.")
 st.caption("Refresh מושך את הנתון האחרון שהמקורות מספקים; הניתוח הטכני משתמש בנרות סגורים בלבד ואינו Tick-by-Tick. הציון הוא סכום משקלים, לא אחוז הצלחה. הוא מכוון לעסקאות קצרות יותר ולא לבניית Swing ארוך. אין ביצוע עסקאות אוטומטי.")
 if data_coverage < 100:
     missing = [name for name,x in [("VVIX",vv),("VIX1D",v1),("SKEW",skew),("COR1M",cor1m)] if x is None]
@@ -1280,11 +1326,16 @@ def fib_text(f):
     if not f.get("valid"): return "אין Impulse ברור","white"
     p=f["phase"]
     mapping={
-        "approaching_up":("VIX עולה לאזור · Watch SHORT","orange"),"approaching_down":("VIX יורד לאזור · Watch LONG","blue"),
-        "decision_zone":("0.50–0.618 · Decision Zone","yellow"),"reject_down":("דחייה מטה → LONG","green"),
-        "rebound_up":("Rebound מעלה → SHORT","red"),"break_above_0618":("פריצה 0.618 → SHORT","red"),
-        "break_below_0618":("שבירה 0.618 → LONG","green"),"below_zone":("מתחת לאזור","white"),
-        "above_zone":("מעל לאזור","white"),"tracking":("מעקב","white")}
+        "approaching_up":("תיקון עולה לכיוון 0.50–0.618 · המתן לחזרה למגמה","yellow"),
+        "approaching_down":("תיקון יורד לכיוון 0.50–0.618 · המתן לחזרה למגמה","yellow"),
+        "decision_zone":("נגיעה באזור 0.50–0.618 · מחכים לאישור המשך","yellow"),
+        "reject_down":("התיקון הסתיים? VIX חוזר למגמה היורדת → LONG","green"),
+        "rebound_up":("התיקון הסתיים? VIX חוזר למגמה העולה → SHORT","red"),
+        "deep_retracement_up":("תיקון עמוק מעבר 0.618 · אין אות, מחכים","yellow"),
+        "deep_retracement_down":("תיקון עמוק מעבר 0.618 · אין אות, מחכים","yellow"),
+        "below_zone":("לפני/מתחת לאזור התיקון","white"),
+        "above_zone":("לפני/מעל לאזור התיקון","white"),
+        "tracking":("מעקב אחרי התיקון","white")}
     return mapping.get(p,(p,"white"))
 
 def pat_text(p):
@@ -1323,6 +1374,7 @@ st.markdown('<div class="status-grid">'+
     status_row("Repeated S/R · 12H",sr12t,sr12c)+
     status_row("Smart Fib · 12H",f12t,f12c)+
     status_row("Institutional Fast Pressure",instt,instc)+
+    status_row("Setup Alignment",conflict_text,conflict_cls)+
     status_row("Volatility Regime",REGIME,regime_cls)+
     status_row("VIX Intraday RV",rv_text,"orange" if np.isfinite(VIX_RV_RATIO) and VIX_RV_RATIO>=1.35 else "white")+
     status_row("Term Structure",term_text,term_cls)+
@@ -1334,7 +1386,7 @@ for tf,f,z in [("4H",FIB4,SR4),("12H",FIB12,SR12)]:
     if f.get("valid"):
         arrow="↓" if f["direction"]=="down" else "↑"; ft,_=fib_text(f)
         zone_note=(f"תמיכה {z['support_touches']} נגיעות" if z['state']=='support' else (f"התנגדות {z['resistance_touches']} נגיעות" if z['state']=='resistance' else "ללא S/R רב-נגיעות פעיל"))
-        st.markdown(f'<div class="panel"><b>Smart Fib {tf} {arrow}</b><br>Impulse: <bdi dir="ltr">{f["start"]:.2f} → {f["end"]:.2f}</bdi> · אזור <bdi dir="ltr">0.50–0.618 = {f["zone_low"]:.2f}–{f["zone_high"]:.2f}</bdi><br>VIX <bdi dir="ltr">{f["current"]:.2f}</bdi> · {ft} · {zone_note}<br><span class="muted">Fib לבדו לא נותן כניסה; נדרש אישור Divergence / תבנית / אזור רב-נגיעות.</span></div>',unsafe_allow_html=True)
+        st.markdown(f'<div class="panel"><b>Smart Fib {tf} {arrow}</b><br>Impulse: <bdi dir="ltr">{f["start"]:.2f} → {f["end"]:.2f}</bdi> · אזור <bdi dir="ltr">0.50–0.618 = {f["zone_low"]:.2f}–{f["zone_high"]:.2f}</bdi><br>VIX <bdi dir="ltr">{f["current"]:.2f}</bdi> · {ft} · {zone_note}<br><span class="muted">Fib הוא כלי תיקון/המשך: מחפשים Impulse, תיקון ל-0.50–0.618 ואז חזרה למגמה הקודמת. מעבר 0.618 אינו פריצה ואינו אות כניסה. נדרש אישור נוסף.</span></div>',unsafe_allow_html=True)
 
 # Minimal execution reminder
 if "SHORT" in state: action="חפש טריגר SHORT קצר ב-QQQ/Nasdaq; זה אינו אישור כניסה אוטומטי"
@@ -1343,7 +1395,7 @@ else: action="אין עסקה — המתן לסנכרון"
 st.markdown(f'<div class="panel" style="text-align:center;font-weight:900">{action}</div>',unsafe_allow_html=True)
 
 with st.expander("פירוט החישוב"):
-    st.write("**מבנה v11.0:** Divergence 1H+4H הוא הליבה; 12H בונוס. Fib נבדק ב-4H/12H ורק עם אישורים. תבניות W/M/יתד נבדקות ב-1H/4H. אין יותר Market Confirmation ואין EMA.")
+    st.write("**מבנה v11.1:** Divergence 1H+4H הוא הליבה; 12H בונוס. Fib נבדק ב-4H/12H ורק עם אישורים. תבניות W/M/יתד נבדקות ב-1H/4H. אין יותר Market Confirmation ואין EMA.")
     st.write(f"Divergence: 1H={DIV1} · 4H={DIV4} · 12H={DIV12}")
     st.write(f"Pattern: 1H={PAT1['pattern']} ({PAT1['bias']}) · 4H={PAT4['pattern']} ({PAT4['bias']})")
     st.write(f"Repeated S/R 4H: {SR4['state']} · support touches={SR4['support_touches']} · resistance touches={SR4['resistance_touches']}")
@@ -1379,4 +1431,4 @@ with st.expander("מקורות נתונים / גיבוי"):
     st.write(f"VIX OHLC 60m: **{source_name(vo_intra)}**")
     st.caption("גיבוי אמיתי: Yahoo/yfinance → Yahoo Chart API ישיר → Cboe הרשמי למדדי תנודתיות/אופציות. FRED משמש ל-VIX/VIX3M במידת הצורך. רכיב Institutional הוא אופציונלי: מקור חסר מוריד Data Coverage ואינו מוחלף בנתון מומצא.")
 
-st.caption(f"עודכן {pd.Timestamp.now(tz='Asia/Jerusalem').strftime('%H:%M')} · v11.0 Volatility Intelligence · שעון ישראל · Multi-Source + Retry פעיל · כלי מחקרי, לא ייעוץ השקעות")
+st.caption(f"עודכן {pd.Timestamp.now(tz='Asia/Jerusalem').strftime('%H:%M')} · v11.1 Precision Continuation · שעון ישראל · Multi-Source + Retry פעיל · כלי מחקרי, לא ייעוץ השקעות")

@@ -85,3 +85,12 @@ streamlit run app.py
 - Refresh pulls the newest observation exposed by each public source.
 - Technical 1H/4H/12H logic remains closed-candle only; not tick-by-tick.
 - UI now explicitly shows Last data update.
+
+## v11.1 Precision Continuation
+- Smart Fib semantics corrected: Fibonacci is a retracement/continuation tool, not breakout logic.
+- Old VIX downtrend: correction upward into 0.50–0.618, then confirmed resumption downward supports QQQ/Nasdaq LONG.
+- Old VIX uptrend: correction downward into 0.50–0.618, then confirmed resumption upward supports QQQ/Nasdaq SHORT.
+- Crossing 0.618 is now deep-retracement context only and scores zero by itself.
+- 12H Fib weight reduced; 12H remains context/bonus.
+- Added explicit Setup Alignment / MIXED status.
+- Added freshness diagnostics for unusually old 1H/4H/12H bars.
