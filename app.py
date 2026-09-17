@@ -121,6 +121,33 @@ def fresh_history(obj, interval, now=None):
     return expected is not None and expected in idx.tz_convert('UTC')
 
 
+def closed_session_hourly(obj, now=None):
+    """Return only fully closed regular-session hourly source bars.
+
+    This prevents the 1H trigger from reading a still-forming Yahoo candle.
+    """
+    x=clean_history(obj)
+    if x is None:
+        return None
+    now=utc_now(now); phase=feed_phase(x)
+    idx=x.index
+    idx=idx.tz_localize(TZ) if idx.tz is None else idx.tz_convert(TZ)
+    x=x.copy(); x.index=idx.tz_convert('UTC')
+    sched=schedule(now)
+    sched=sched[(sched['close']>=x.index.min())&(sched['open']<=now)]
+    keep=[]
+    for _,day in sched.iterrows():
+        for t in hourly_grid(day['open'],day['close'],phase):
+            if min(t+pd.Timedelta(hours=1),day['close'])+pd.Timedelta(minutes=15)<=now and t in x.index:
+                keep.append(t)
+    if not keep:
+        return None
+    out=x.loc[pd.DatetimeIndex(keep)].copy()
+    out.index=out.index.tz_convert(TZ)
+    out.attrs=obj.attrs.copy()
+    return out
+
+
 def session_bars(obj, hours, now=None):
     """Aggregate actual hourly samples using their native timestamp phase.
 
@@ -186,7 +213,7 @@ def latest_bucket_start(hours, now=None, obj=None):
                 result=label.tz_convert(TZ)
     return result
 
-st.set_page_config(page_title="VIX Swing", page_icon="🎯", layout="centered")
+st.set_page_config(page_title="VIX Tactical", page_icon="🎯", layout="centered")
 
 st.markdown('''
 <style>
@@ -228,7 +255,7 @@ html,body,[class*="css"]{background:var(--bg);color:var(--txt)}
 
 DATA_TIMEOUT = 8
 HTTP_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (VIX-Swing/10.7; Streamlit)",
+    "User-Agent": "Mozilla/5.0 (VIX-Tactical/10.8; Streamlit)",
     "Accept": "application/json,text/csv,*/*",
 }
 
@@ -241,11 +268,6 @@ CBOE_SYMBOLS = {
     "^VIX1D": "VIX1D",
     "^SKEW": "SKEW",
     "^COR1M": "COR1M",
-}
-
-STOOQ_SYMBOLS = {
-    "^NDX": "^ndx",
-    "^GSPC": "^spx",
 }
 
 def _mark_source(obj, source):
@@ -421,25 +443,6 @@ def _fred_daily_close(ticker):
     except Exception:
         return None
 
-def _stooq_daily_close(ticker):
-    """Independent daily-index fallback for NDX/SPX."""
-    symbol = STOOQ_SYMBOLS.get(ticker)
-    if not symbol:
-        return None
-    try:
-        url = f"https://stooq.com/q/d/l/?s={quote(symbol)}&i=d"
-        r = requests.get(url, headers=HTTP_HEADERS, timeout=DATA_TIMEOUT)
-        r.raise_for_status()
-        df = pd.read_csv(StringIO(r.text))
-        if "Date" not in df.columns or "Close" not in df.columns:
-            return None
-        idx = pd.to_datetime(df["Date"], errors="coerce")
-        vals = pd.to_numeric(df["Close"], errors="coerce")
-        s = pd.Series(vals.values, index=idx).dropna().sort_index().astype(float)
-        return s if len(s) else None
-    except Exception:
-        return None
-
 def _tail_for_period(s, period):
     if s is None:
         return None
@@ -488,10 +491,6 @@ def fetch_close(ticker, period="6mo", interval="1d"):
         if _valid_history(c, period, interval):
             return _mark_source(c, "FRED / Cboe")
 
-        c = _stooq_daily_close(ticker)
-        c = _prepare_history(_tail_for_period(c, period), interval)
-        if _valid_history(c, period, interval):
-            return _mark_source(c, "Stooq")
     return None
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -507,7 +506,6 @@ def fetch_ohlc(ticker, period="3mo", interval="1d"):
         return _mark_source(out, "Yahoo Chart API")
     return None
 
-def ema_series(s,n): return s.ewm(span=n,adjust=False).mean()
 def pctn(s,n): return float((s.iloc[-1]/s.iloc[-1-n]-1)*100) if s is not None and len(s)>n else np.nan
 
 def resample_close(s, hours):
@@ -637,28 +635,6 @@ def detect_divergence(s, lookback=45, pivot=2, min_sep=3, min_price_pct=0.7, min
 
     return "none"
 
-def cross_status(s):
-    e9=ema_series(s,9); e26=ema_series(s,26)
-    cross=None; age=None
-    start=max(1,len(s)-8)
-    for i in range(start,len(s)):
-        if e9.iloc[i-1] <= e26.iloc[i-1] and e9.iloc[i] > e26.iloc[i]: cross="golden"; age=len(s)-1-i
-        if e9.iloc[i-1] >= e26.iloc[i-1] and e9.iloc[i] < e26.iloc[i]: cross="death"; age=len(s)-1-i
-    gap_now=float((e9.iloc[-1]-e26.iloc[-1])/e26.iloc[-1]*100)
-    gap_prev=float((e9.iloc[-4]-e26.iloc[-4])/e26.iloc[-4]*100) if len(s)>=4 else gap_now
-    approaching=None
-    if gap_now<0 and gap_now>gap_prev: approaching="golden"
-    elif gap_now>0 and gap_now<gap_prev: approaching="death"
-    # proximity: distance + closing speed. Confirmed/recent cross = 10.
-    if cross and age is not None and age<=5:
-        proximity=10
-    else:
-        dist=abs(gap_now)
-        dist_score=max(1,min(9,9-int(dist/0.20)))
-        closing=abs(gap_now)<abs(gap_prev)
-        proximity=min(9,dist_score+(1 if closing else 0))
-    return float(e9.iloc[-1]),float(e26.iloc[-1]),cross,age,approaching,int(proximity),gap_now
-
 def support_resistance_signal(df,lookback=22,pivot=2):
     if df is None or len(df)<12: return "neutral",None,None
     x=df.iloc[-(lookback+5):].copy()
@@ -678,7 +654,7 @@ def support_resistance_signal(df,lookback=22,pivot=2):
     return "neutral",support,resistance
 
 def smart_fib_state(df, lookback=55, pivot=2, min_impulse_pct=7.0):
-    """Two-way Smart Fibonacci on closed 12H VIX OHLC bars.
+    """Two-way Smart Fibonacci on closed VIX OHLC bars (used on 4H and 12H).
 
     Finds the latest meaningful confirmed swing impulse, then extends its endpoint
     if a newer extreme is made in the same direction. The 0.50-0.618 retracement
@@ -778,104 +754,168 @@ def smart_fib_state(df, lookback=55, pivot=2, min_impulse_pct=7.0):
             "zone_low":float(zone_low),"zone_high":float(zone_high),"current":cur,
             "phase":phase,"distance_pct":float(dist),"impulse_pct":float(move)}
 
+
+def repeated_sr_zone(df, lookback=50, pivot=2, tol_pct=1.2, min_touches=3):
+    """Find repeated VIX support/resistance zones from clustered pivot candles.
+
+    A level is considered meaningful only when several separate pivot candles touched
+    roughly the same price area. This is intentionally stricter than a single pivot.
+    """
+    out={"support":np.nan,"resistance":np.nan,"support_touches":0,"resistance_touches":0,
+         "near_support":False,"near_resistance":False,"state":"none"}
+    x=clean_history(df)
+    if x is None or len(x)<max(18,pivot*2+8):
+        return out
+    x=x.iloc[-lookback:].copy()
+    highs=[]; lows=[]
+    for i in range(pivot,len(x)-pivot):
+        wh=x['High'].iloc[i-pivot:i+pivot+1]
+        wl=x['Low'].iloc[i-pivot:i+pivot+1]
+        if x['High'].iloc[i]==wh.max(): highs.append(float(x['High'].iloc[i]))
+        if x['Low'].iloc[i]==wl.min(): lows.append(float(x['Low'].iloc[i]))
+
+    def best_cluster(vals):
+        if len(vals)<min_touches: return (np.nan,0)
+        best=(np.nan,0)
+        for v0 in vals:
+            tol=max(abs(v0)*tol_pct/100,1e-9)
+            members=[v for v in vals if abs(v-v0)<=tol]
+            if len(members)>best[1]:
+                best=(float(np.mean(members)),len(members))
+        return best
+
+    support,st=best_cluster(lows); resistance,rt=best_cluster(highs)
+    cur=float(x['Close'].iloc[-1]); hi=float(x['High'].iloc[-1]); lo=float(x['Low'].iloc[-1])
+    near_s=bool(np.isfinite(support) and (abs(lo-support)/support*100<=tol_pct or abs(cur-support)/support*100<=tol_pct))
+    near_r=bool(np.isfinite(resistance) and (abs(hi-resistance)/resistance*100<=tol_pct or abs(cur-resistance)/resistance*100<=tol_pct))
+    state='resistance' if near_r and rt>=min_touches else ('support' if near_s and st>=min_touches else 'none')
+    return {"support":support,"resistance":resistance,"support_touches":st,"resistance_touches":rt,
+            "near_support":near_s,"near_resistance":near_r,"state":state}
+
+
+def detect_clear_pattern(df, lookback=42, pivot=2):
+    """Detect confirmed M/W or wedge breakout on VIX OHLC.
+
+    The detector deliberately returns only confirmed/clear structures: M/W needs a
+    neckline break and wedges need converging trendlines plus a breakout.
+    """
+    out={"pattern":"none","bias":"none","detail":""}
+    x=clean_history(df)
+    if x is None or len(x)<24:
+        return out
+    x=x.iloc[-lookback:].copy()
+    highs=[]; lows=[]
+    for i in range(pivot,len(x)-pivot):
+        wh=x['High'].iloc[i-pivot:i+pivot+1]; wl=x['Low'].iloc[i-pivot:i+pivot+1]
+        if x['High'].iloc[i]==wh.max() and (wh==x['High'].iloc[i]).sum()==1: highs.append((i,float(x['High'].iloc[i])))
+        if x['Low'].iloc[i]==wl.min() and (wl==x['Low'].iloc[i]).sum()==1: lows.append((i,float(x['Low'].iloc[i])))
+    close=float(x['Close'].iloc[-1])
+
+    # Confirmed M: two similar highs, meaningful valley, then close below neckline.
+    if len(highs)>=2:
+        h1,h2=highs[-2],highs[-1]
+        if h2[0]-h1[0]>=4:
+            between=x['Low'].iloc[h1[0]:h2[0]+1]
+            neckline=float(between.min())
+            peak_avg=(h1[1]+h2[1])/2
+            if abs(h2[1]-h1[1])/peak_avg<=0.025 and (peak_avg/neckline-1)>=0.03 and close<neckline*0.998:
+                return {"pattern":"M","bias":"bearish","detail":f"M מאושר · neckline {neckline:.2f}"}
+
+    # Confirmed W: two similar lows, meaningful middle peak, then close above neckline.
+    if len(lows)>=2:
+        l1,l2=lows[-2],lows[-1]
+        if l2[0]-l1[0]>=4:
+            between=x['High'].iloc[l1[0]:l2[0]+1]
+            neckline=float(between.max())
+            low_avg=(l1[1]+l2[1])/2
+            if abs(l2[1]-l1[1])/low_avg<=0.025 and (neckline/low_avg-1)>=0.03 and close>neckline*1.002:
+                return {"pattern":"W","bias":"bullish","detail":f"W מאושר · neckline {neckline:.2f}"}
+
+    # Wedge: regress recent pivot highs/lows. Both boundaries must point the same way,
+    # converge, and price must break the expected boundary.
+    if len(highs)>=3 and len(lows)>=3:
+        hh=highs[-4:]; ll=lows[-4:]
+        hx=np.array([a for a,_ in hh],float); hy=np.array([b for _,b in hh],float)
+        lx=np.array([a for a,_ in ll],float); ly=np.array([b for _,b in ll],float)
+        hs,hi=np.polyfit(hx,hy,1); ls,li=np.polyfit(lx,ly,1)
+        n=len(x)-1
+        upper_now=hs*n+hi; lower_now=ls*n+li
+        n0=max(0,n-12); upper_old=hs*n0+hi; lower_old=ls*n0+li
+        width_old=upper_old-lower_old; width_now=upper_now-lower_now
+        converging=width_old>0 and width_now>0 and width_now<=width_old*0.82
+        if converging and hs>0 and ls>0 and ls>hs and close<lower_now*0.998:
+            return {"pattern":"Bearish Wedge","bias":"bearish","detail":"יתד עולה/דובית מאושרת בשבירה מטה"}
+        if converging and hs<0 and ls<0 and hs>ls and close>upper_now*1.002:
+            return {"pattern":"Bullish Wedge","bias":"bullish","detail":"יתד יורדת/שורית מאושרת בפריצה מעלה"}
+    return out
+
 def status_row(name,value,cls="white"):
     return f'<div class="status"><div class="status-name"><bdi>{name}</bdi></div><div class="status-val {cls}"><bdi>{value}</bdi></div></div>'
 
-st.markdown('<div class="hero"><div class="hero-title">🎯 VIX Swing</div><div class="muted">כיוון המדד במבט אחד · v10.7 Smart Fib</div></div>',unsafe_allow_html=True)
+st.markdown('<div class="hero"><div class="hero-title">🎯 VIX Tactical</div><div class="muted">עסקאות קצרות · 1H טריגר · 4H אישור · 12H בונוס · v10.8</div></div>',unsafe_allow_html=True)
 if st.button("🔄 רענן",use_container_width=True): st.cache_data.clear(); st.rerun()
 
-market_name=st.radio("מדד",["Nasdaq 100","S&P 500"],horizontal=True,label_visibility="collapsed")
-market_ticker="^NDX" if market_name=="Nasdaq 100" else "^GSPC"
-st.markdown(f'<div class="panel" dir="rtl">הכיוון מתייחס למדד שנבחר: <bdi dir="ltr">{market_name}</bdi><br><bdi dir="ltr">LONG</bdi> — חיפוש עלייה במדד<br><bdi dir="ltr">SHORT</bdi> — חיפוש ירידה במדד</div>', unsafe_allow_html=True)
+st.markdown('<div class="panel" dir="rtl"><bdi dir="ltr">LONG</bdi> — חיפוש עלייה ב-QQQ/Nasdaq · <bdi dir="ltr">SHORT</bdi> — חיפוש ירידה ב-QQQ/Nasdaq<br><span class="muted">אין יותר ניקוד או אישור מה-Nasdaq/S&P עצמם. הכיוון נגזר מה-VIX בלבד.</span></div>', unsafe_allow_html=True)
 with st.expander("איך לקרוא את האיתות והזמנים"):
-    st.markdown('<div dir="rtl">החישוב משתמש בנרות סגורים בלבד. הכינוי <bdi dir="ltr">12H</bdi> הוא סיכום סשן מסחר, ולא נר של 12 שעות רצופות. סיכומי <bdi dir="ltr">4H</bdi> ונתוני הסשן תלויים בשעות שמספק המקור; כשנרות המקור אינם מיושרים לפתיחה, הסיכומים מקורבים ואינם כוללים חלק פתיחה שאין עליו נר מלא. נשמר מרווח פרסום של 15 דקות.</div>',unsafe_allow_html=True)
+    st.markdown('<div dir="rtl">המודל מיועד לעסקאות קצרות: <bdi dir="ltr">1H</bdi> הוא טריגר מהיר, <bdi dir="ltr">4H</bdi> הוא האישור המרכזי, ו-<bdi dir="ltr">12H</bdi> משמש כבונוס/הקשר. החישוב משתמש בנרות סגורים בלבד. סיכומי 4H/12H נוצרים מנתוני שעה זמינים ולכן הם סיכומי סשן ולא נרות בורסה מקוריים.</div>',unsafe_allow_html=True)
 
-with st.spinner("בודק נתונים ומחשב… מקור שאינו מגיב עלול להאריך את הטעינה"):
+with st.spinner("בודק נתוני VIX ומחשב… מקור שאינו מגיב עלול להאריך את הטעינה"):
     v=fetch_close("^VIX",period="6mo")
     vo_intra=fetch_ohlc("^VIX",period="60d",interval="60m")
     v_intra=vo_intra["Close"] if vo_intra is not None else None
     v9=fetch_close("^VIX9D",period="6mo")
     v3=fetch_close("^VIX3M",period="6mo")
     vv=fetch_close("^VVIX",period="6mo")
-    # Institutional / options-market layer. These are optional: the core model keeps
-    # running when one source is temporarily unavailable, and the UI reports coverage.
     v1=fetch_close("^VIX1D",period="6mo")
     skew=fetch_close("^SKEW",period="6mo")
     cor1m=fetch_close("^COR1M",period="6mo")
-    m=fetch_close(market_ticker,period="6mo")
-    mo_intra=fetch_ohlc(market_ticker,period="60d",interval="60m")
-    m_intra=mo_intra["Close"] if mo_intra is not None else None
 
 # Revalidate cached frames as the session changes.
-v, v9, v3, vv, v1, skew, cor1m, m = [
+v, v9, v3, vv, v1, skew, cor1m = [
     x if _valid_history(x,"6mo","1d") else None
-    for x in (v,v9,v3,vv,v1,skew,cor1m,m)
+    for x in (v,v9,v3,vv,v1,skew,cor1m)
 ]
-required_daily = {
-    "VIX": v,
-    "VIX9D": v9,
-    "VIX3M": v3,
-    market_name: m,
-}
-failed_daily = [name for name, x in required_daily.items() if x is None or len(x) < 30]
+required_daily = {"VIX":v,"VIX9D":v9,"VIX3M":v3}
+failed_daily=[name for name,x in required_daily.items() if x is None or len(x)<30]
 if failed_daily:
-    st.error("לא הצלחתי להשיג נתונים מלאים ועדכניים עבור: " + ", ".join(failed_daily) + ". ניסיתי Yahoo, מקור Yahoo ישיר, Cboe הרשמי, FRED ובמידת האפשר גם Stooq.")
-    with st.expander("אבחון מקורות נתונים"):
-        for name, x in required_daily.items():
-            st.write(f"{name}: {'✅' if x is not None and len(x)>=30 else '❌'} · {source_name(x)} · {len(x) if x is not None else 0} נקודות")
+    st.error("לא הצלחתי להשיג נתונים מלאים ועדכניים עבור: "+", ".join(failed_daily)+". ניסיתי Yahoo, Yahoo API ישיר, Cboe הרשמי ו-FRED במידת האפשר.")
+    st.stop()
+
+if vo_intra is None or v_intra is None or len(vo_intra)<40 or not fresh_history(v_intra,"60m"):
+    st.error("אין כרגע מספיק נתוני VIX שעתיים מלאים ועדכניים. אין איתות עד שהמקור חוזר להיות מסונכרן.")
     st.stop()
 
 V=float(v.iloc[-1]); V9=float(v9.iloc[-1]); V3=float(v3.iloc[-1]); VV=float(vv.iloc[-1]) if vv is not None and len(vv) else np.nan
 V1=float(v1.iloc[-1]) if v1 is not None and len(v1) else np.nan
 SKEW=float(skew.iloc[-1]) if skew is not None and len(skew) else np.nan
 COR1M=float(cor1m.iloc[-1]) if cor1m is not None and len(cor1m) else np.nan
-V12=resample_close(v_intra,12)
-M12=resample_close(m_intra,12)
-VO12=resample_ohlc(vo_intra,12)
-MO12=resample_ohlc(mo_intra,12)
-if V12 is None or len(V12)<30 or VO12 is None or len(VO12)<20 or M12 is None or len(M12)<20 or MO12 is None or len(MO12)<20:
-    failed_intraday=[]
-    if V12 is None or len(V12)<30: failed_intraday.append("VIX Close 60m → 12H")
-    if VO12 is None or len(VO12)<20: failed_intraday.append("VIX OHLC 60m → 12H")
-    if M12 is None or len(M12)<20: failed_intraday.append(f"{market_name} 60m → 12H")
-    if MO12 is None or len(MO12)<20: failed_intraday.append(f"{market_name} OHLC 60m → 12H")
-    st.error("אין כרגע מספיק נתונים תוך־יומיים לבניית הניתוח. פירוט המקורות מופיע למטה.")
-    with st.expander("אבחון מקורות נתונים", expanded=True):
-        st.write("רכיבים חסרים: " + ", ".join(failed_intraday))
-        st.write(f"VIX Close 60m: {source_name(v_intra)} · {len(v_intra) if v_intra is not None else 0} נקודות")
-        st.write(f"VIX OHLC 60m: {source_name(vo_intra)} · {len(vo_intra) if vo_intra is not None else 0} נקודות")
-        st.write(f"{market_name} 60m: {source_name(m_intra)} · {len(m_intra) if m_intra is not None else 0} נקודות")
-        st.write(f"{market_name} OHLC 60m: {source_name(mo_intra)} · {len(mo_intra) if mo_intra is not None else 0} נקודות")
-        for label,frame in [("VIX",vo_intra),(market_name,mo_intra)]:
-            if frame is not None and len(frame):
-                st.code(f"{label}: last={frame.index[-1]} | recent timestamps=" + ", ".join(str(t) for t in frame.index[-8:]),language=None)
-        st.caption("נדרש סיכום סשן מנתונים תוך־יומיים מלאים. המערכת תומכת בחותמות זמן שעתיות שונות ואינה מזיזה נרות או משלימה מחירים חסרים.")
-    st.stop()
-V4=resample_close(v_intra,4)
-M4=resample_close(m_intra,4)
-expected_day=latest_daily_session()
-if (V4 is None or len(V4)<30 or M4 is None
-    or V12.index[-1].tz_localize(None).normalize()<expected_day
-    or M12.index[-1].tz_localize(None).normalize()<expected_day
+
+VO1H=closed_session_hourly(vo_intra)
+V1H=VO1H["Close"] if VO1H is not None else None
+V4=resample_close(v_intra,4); V12=resample_close(v_intra,12)
+VO4=resample_ohlc(vo_intra,4); VO12=resample_ohlc(vo_intra,12)
+if (V1H is None or len(V1H)<35 or VO1H is None or len(VO1H)<35 or V4 is None or len(V4)<30 or V12 is None or len(V12)<25 or VO4 is None or len(VO4)<20 or VO12 is None or len(VO12)<18
     or V4.index[-1] != latest_bucket_start(4,obj=v_intra)
-    or M4.index[-1] != latest_bucket_start(4,obj=m_intra)
-    or V12.index[-1] != latest_bucket_start(12,obj=v_intra)
-    or M12.index[-1] != latest_bucket_start(12,obj=m_intra)
-    or not fresh_history(v_intra,"60m") or not fresh_history(m_intra,"60m")):
-    st.error("ממתינים לנתונים מלאים ומסונכרנים של VIX והמדד. אין איתות כאשר נתוני המקור ישנים או חסרים.")
+    or V12.index[-1] != latest_bucket_start(12,obj=v_intra)):
+    st.error("ממתינים לנרות VIX מלאים של 1H/4H/12H. אין איתות כאשר אחד הטיימפריימים חסר או ישן.")
     st.stop()
-V12_LAST=float(V12.iloc[-1])
-VE9,VE26,CROSS,CROSS_AGE,APPROACH,CROSS_NEAR,GAP=cross_status(V12)
+
 C1=pctn(v,1); C5=pctn(v,5); R9=V9/V; R3=V/V3
 R1=(V1/V) if np.isfinite(V1) and V>0 else np.nan
 R1_9=(V1/V9) if np.isfinite(V1) and V9>0 else np.nan
-M=float(m.iloc[-1]); M2=pctn(m,2); M5=pctn(m,5)
+
+# Short-trade divergence hierarchy: 1H trigger + 4H main confirmation + 12H bonus.
+DIV1=detect_divergence(V1H, lookback=72, pivot=3, min_sep=4, min_price_pct=0.55, min_rsi_delta=3.5, recent_bars=10)
 DIV4=detect_divergence(V4, lookback=60, pivot=3, min_sep=4, min_price_pct=0.75, min_rsi_delta=4.0, recent_bars=8)
 DIV12=detect_divergence(V12, lookback=50, pivot=2, min_sep=3, min_price_pct=1.0, min_rsi_delta=4.0, recent_bars=6)
-SWING12=swing_exhaustion_signal(V12, lookback=50, pivot=2, recent_bars=7, min_swing_pct=1.5, rejection_pct=1.5)
-SR, SUPPORT, RESISTANCE=support_resistance_signal(MO12,44,2)
-VIX_SR, VIX_SUPPORT, VIX_RESISTANCE=support_resistance_signal(VO12,44,2)
+
+# Repeated candle zones, Fib and clear patterns on the timeframes that matter for short trades.
+SR4=repeated_sr_zone(VO4,lookback=50,pivot=2,tol_pct=1.15,min_touches=3)
+SR12=repeated_sr_zone(VO12,lookback=45,pivot=2,tol_pct=1.25,min_touches=3)
+FIB4=smart_fib_state(VO4,lookback=60,pivot=2,min_impulse_pct=5.0)
 FIB12=smart_fib_state(VO12,lookback=55,pivot=2,min_impulse_pct=7.0)
+PAT1=detect_clear_pattern(VO1H,lookback=48,pivot=2)
+PAT4=detect_clear_pattern(VO4,lookback=42,pivot=2)
 
 # Institutional pressure metrics. Use relative/z-score logic rather than fixed raw levels
 # so the model adapts across calm and stressed volatility regimes.
@@ -889,70 +929,70 @@ COR5=pctn(cor1m,5) if cor1m is not None else np.nan
 COR_Z=rolling_zscore_last(cor1m,60) if cor1m is not None else np.nan
 
 score=0.0; reasons=[]
-category_scores={
-    "VIX Reversal":0.0,
-    "Institutional":0.0,
-    "Vol Curve":0.0,
-    "Market Confirmation":0.0,
-    "EMA":0.0,
-}
+category_scores={"VIX Tactical":0.0,"Institutional":0.0,"Vol Curve":0.0}
 
 def addcat(cat,p,t):
     global score
-    p=float(p)
-    category_scores[cat]+=p
-    score+=p
-    reasons.append((p,t,cat))
+    p=float(p); category_scores[cat]+=p; score+=p; reasons.append((p,t,cat))
 
 # -----------------------------------------------------------------------------
-# 1) VIX REVERSAL / STRUCTURE — ~45% of total model weight
-# Divergence is intentionally the dominant signal. Higher-high/lower-low swing
-# structure is scored only after rejection/rebound confirmation, never by itself.
+# 1) VIX TACTICAL STRUCTURE — short-trade model
+# 1H = fast trigger, 4H = main confirmation, 12H = bonus/context.
 # -----------------------------------------------------------------------------
-if DIV12=="bullish": addcat("VIX Reversal", 1.90,"VIX 12H Bullish RSI Divergence → VIX UP / מדד SHORT")
-elif DIV12=="bearish": addcat("VIX Reversal",-1.90,"VIX 12H Bearish RSI Divergence → VIX DOWN / מדד LONG")
+if DIV1=="bullish": addcat("VIX Tactical", 2.00,"VIX 1H Bullish RSI Divergence → VIX UP / QQQ SHORT")
+elif DIV1=="bearish": addcat("VIX Tactical",-2.00,"VIX 1H Bearish RSI Divergence → VIX DOWN / QQQ LONG")
 
-if DIV4=="bullish": addcat("VIX Reversal", 1.00,"VIX 4H Bullish RSI Divergence → SHORT")
-elif DIV4=="bearish": addcat("VIX Reversal",-1.00,"VIX 4H Bearish RSI Divergence → LONG")
+if DIV4=="bullish": addcat("VIX Tactical", 2.20,"VIX 4H Bullish RSI Divergence → אישור חזק SHORT")
+elif DIV4=="bearish": addcat("VIX Tactical",-2.20,"VIX 4H Bearish RSI Divergence → אישור חזק LONG")
 
-if DIV4==DIV12=="bullish": addcat("VIX Reversal", 0.45,"סנכרון Divergence 4H+12H → SHORT")
-elif DIV4==DIV12=="bearish": addcat("VIX Reversal",-0.45,"סנכרון Divergence 4H+12H → LONG")
+if DIV1==DIV4=="bullish": addcat("VIX Tactical", 0.80,"סנכרון Divergence 1H+4H → SHORT")
+elif DIV1==DIV4=="bearish": addcat("VIX Tactical",-0.80,"סנכרון Divergence 1H+4H → LONG")
 
-if SWING12=="higher_high_rejection":
-    addcat("VIX Reversal",-0.65,"VIX יצר שיא עולה ודחה מטה → פוטנציאל ירידת VIX / LONG")
-elif SWING12=="lower_low_rebound":
-    addcat("VIX Reversal", 0.30,"VIX יצר שפל יורד וחזר מעלה → פוטנציאל עליית VIX / SHORT")
+if DIV12=="bullish": addcat("VIX Tactical", 0.50,"בונוס: VIX 12H Bullish Divergence → SHORT")
+elif DIV12=="bearish": addcat("VIX Tactical",-0.50,"בונוס: VIX 12H Bearish Divergence → LONG")
 
-# VIX S/R is supportive, but deliberately smaller than divergence.
-if VIX_SR=="bounce_support": addcat("VIX Reversal", 0.40,"VIX 12H תגובה מתמיכה → SHORT")
-elif VIX_SR=="reject_resistance": addcat("VIX Reversal",-0.40,"VIX 12H דחייה מהתנגדות → LONG")
-elif VIX_SR=="breakout": addcat("VIX Reversal", 0.50,"VIX 12H פריצה מעל התנגדות → SHORT")
-elif VIX_SR=="breakdown": addcat("VIX Reversal",-0.50,"VIX 12H שבירה מתחת לתמיכה → LONG")
+# Clear patterns. Bullish pattern on VIX supports SHORT in QQQ; bearish pattern supports LONG.
+def score_pattern(pat, tf, w):
+    if pat.get("bias")=="bullish": addcat("VIX Tactical", w,f"VIX {tf} {pat['pattern']} שורי מאושר → SHORT")
+    elif pat.get("bias")=="bearish": addcat("VIX Tactical",-w,f"VIX {tf} {pat['pattern']} דובי מאושר → LONG")
+score_pattern(PAT1,"1H",0.55)
+score_pattern(PAT4,"4H",0.90)
+if PAT1.get("bias")!='none' and PAT1.get("bias")==PAT4.get("bias"):
+    addcat("VIX Tactical",0.35 if PAT1['bias']=='bullish' else -0.35,"סנכרון תבנית 1H+4H")
 
-# Smart Fib is supportive only. It never scores from location alone: the route to
-# 0.50-0.618 or the reaction from it needs at least two independent confirmations.
-rise_conf=sum([
-    DIV12=="bullish", DIV4=="bullish", VIX_SR in ("breakout","bounce_support"),
-    V12_LAST>VE9, VE9>VE26, len(V4)>=2 and float(V4.iloc[-1])>float(V4.iloc[-2])
-])
-fall_conf=sum([
-    DIV12=="bearish", DIV4=="bearish", VIX_SR in ("breakdown","reject_resistance"),
-    V12_LAST<VE9, VE9<VE26, len(V4)>=2 and float(V4.iloc[-1])<float(V4.iloc[-2])
-])
-if FIB12.get("valid"):
-    fp=FIB12["phase"]
-    if fp=="approaching_up" and rise_conf>=2:
-        addcat("VIX Reversal", 0.45,"Smart Fib: VIX עולה לכיוון 0.50–0.618 + אישורים → SHORT במדד")
-    elif fp=="approaching_down" and fall_conf>=2:
-        addcat("VIX Reversal",-0.45,"Smart Fib: VIX יורד לכיוון 0.50–0.618 + אישורים → LONG במדד")
-    elif fp=="reject_down" and fall_conf>=2:
-        addcat("VIX Reversal",-0.55,"Smart Fib: דחיית VIX מטה מאזור 0.50–0.618 → LONG במדד")
-    elif fp=="rebound_up" and rise_conf>=2:
-        addcat("VIX Reversal", 0.55,"Smart Fib: rebound של VIX מאזור 0.50–0.618 → SHORT במדד")
-    elif fp=="break_above_0618" and rise_conf>=2:
-        addcat("VIX Reversal", 0.55,"Smart Fib: VIX פרץ 0.618 כלפי מעלה + אישורים → המשך SHORT במדד")
-    elif fp=="break_below_0618" and fall_conf>=2:
-        addcat("VIX Reversal",-0.55,"Smart Fib: VIX שבר 0.618 מטה + אישורים → המשך LONG במדד")
+# Repeated support/resistance zones from several candles.
+if SR4["state"]=="support": addcat("VIX Tactical",0.45,f"VIX 4H באזור תמיכה חוזרת ({SR4['support_touches']} נגיעות) → SHORT")
+elif SR4["state"]=="resistance": addcat("VIX Tactical",-0.45,f"VIX 4H באזור התנגדות חוזרת ({SR4['resistance_touches']} נגיעות) → LONG")
+if SR12["state"]=="support": addcat("VIX Tactical",0.25,f"בונוס 12H: תמיכה חוזרת ({SR12['support_touches']} נגיעות) → SHORT")
+elif SR12["state"]=="resistance": addcat("VIX Tactical",-0.25,f"בונוס 12H: התנגדות חוזרת ({SR12['resistance_touches']} נגיעות) → LONG")
+
+# Smart Fib on 4H + 12H. Location alone does not score; reaction/break or repeated
+# support/resistance + matching divergence/pattern is required.
+def fib_confirmation_count(direction):
+    if direction=='up':
+        return sum([DIV1=='bullish',DIV4=='bullish',DIV12=='bullish',PAT1.get('bias')=='bullish',PAT4.get('bias')=='bullish'])
+    return sum([DIV1=='bearish',DIV4=='bearish',DIV12=='bearish',PAT1.get('bias')=='bearish',PAT4.get('bias')=='bearish'])
+
+def fib_repeated_level_overlap(f,z):
+    """Fib zone must overlap a repeated candle S/R cluster (3+ touches)."""
+    if not f.get('valid'): return False
+    pad=max(0.05,0.01*f['current'])
+    if f.get('direction')=='down':
+        level=z.get('resistance',np.nan); touches=z.get('resistance_touches',0)
+    else:
+        level=z.get('support',np.nan); touches=z.get('support_touches',0)
+    return bool(touches>=3 and np.isfinite(level) and f['zone_low']-pad<=level<=f['zone_high']+pad)
+
+def score_fib(f,z,tf,base,react):
+    if not f.get('valid') or not fib_repeated_level_overlap(f,z): return
+    fp=f['phase']; rise=fib_confirmation_count('up'); fall=fib_confirmation_count('down')
+    if fp=='approaching_up' and rise>=1: addcat("VIX Tactical", base,f"Smart Fib {tf} + התנגדות רב-נגיעות: VIX עולה לאזור → SHORT Watch")
+    elif fp=='approaching_down' and fall>=1: addcat("VIX Tactical",-base,f"Smart Fib {tf} + תמיכה רב-נגיעות: VIX יורד לאזור → LONG Watch")
+    elif fp in ('rebound_up','break_above_0618') and rise>=1: addcat("VIX Tactical", react,f"Smart Fib {tf} + S/R רב-נגיעות: תגובה שורית ב-VIX → SHORT")
+    elif fp in ('reject_down','break_below_0618') and fall>=1: addcat("VIX Tactical",-react,f"Smart Fib {tf} + S/R רב-נגיעות: תגובה דובית ב-VIX → LONG")
+
+score_fib(FIB4,SR4,'4H',0.45,0.75)
+score_fib(FIB12,SR12,'12H',0.25,0.45)
 
 # -----------------------------------------------------------------------------
 # 2) INSTITUTIONAL VOLATILITY PRESSURE — 25%
@@ -1018,70 +1058,29 @@ elif C1<=-3 or C5<=-4: addcat("Vol Curve",-0.25,"VIX impulse מטה")
 if V>=30: addcat("Vol Curve", 0.10,"VIX ≥30")
 elif V<15: addcat("Vol Curve",-0.10,"VIX <15")
 
-# -----------------------------------------------------------------------------
-# 4) MARKET CONFIRMATION — 10%
-# Nasdaq/S&P confirms the volatility read; it does not lead the VIX model.
-# -----------------------------------------------------------------------------
-if M2<=-0.5: addcat("Market Confirmation", 0.15,f"{market_name} מומנטום 2D שלילי")
-elif M2>=0.5: addcat("Market Confirmation",-0.15,f"{market_name} מומנטום 2D חיובי")
-
-if M5<=-1.0: addcat("Market Confirmation", 0.05,f"{market_name} מומנטום 5D שלילי")
-elif M5>=1.0: addcat("Market Confirmation",-0.05,f"{market_name} מומנטום 5D חיובי")
-
-if SR=="reject_resistance": addcat("Market Confirmation", 0.80,f"{market_name}: דחייה מהתנגדות 12H")
-elif SR=="breakout": addcat("Market Confirmation",-0.80,f"{market_name}: פריצה מעל התנגדות 12H")
-elif SR=="bounce_support": addcat("Market Confirmation",-0.80,f"{market_name}: תגובה מתמיכה 12H")
-elif SR=="breakdown": addcat("Market Confirmation", 0.80,f"{market_name}: שבירה מתחת לתמיכה 12H")
-
-# -----------------------------------------------------------------------------
-# 5) EMA 9/26 — only 5%
-# Kept as a small trend filter per design request; never a dominant signal.
-# -----------------------------------------------------------------------------
-addcat("EMA", 0.15 if V12_LAST>VE9 else -0.15,
-       "VIX 12H מעל EMA9" if V12_LAST>VE9 else "VIX 12H מתחת EMA9")
-addcat("EMA", 0.20 if VE9>VE26 else -0.20,
-       "EMA9 מעל EMA26" if VE9>VE26 else "EMA9 מתחת EMA26")
-if CROSS=="golden" and CROSS_AGE is not None and CROSS_AGE<=5:
-    addcat("EMA", 0.15,"Golden Cross טרי ב-VIX")
-elif CROSS=="death" and CROSS_AGE is not None and CROSS_AGE<=5:
-    addcat("EMA",-0.15,"Death Cross טרי ב-VIX")
-
-# Public-source data coverage. Core model = 75%; institutional layer = 25%.
+# Public-source data coverage. Core tactical model = 75%; institutional layer = 25%.
 data_coverage = 75.0 + 25.0 * (institutional_available / institutional_total)
 
-# One clear signal score
-# The internal weighted score and the visible scale now use the SAME units.
-# +5 raw points = SHORT threshold 5/10; -5 raw points = LONG threshold 5/10.
-# This keeps the score intuitive and avoids artificial compression against a theoretical maximum.
-signed_signal = max(-10.0, min(10.0, float(score)))
-signal_score = abs(signed_signal)
+signed_signal=max(-10.0,min(10.0,float(score)))
+signal_score=abs(signed_signal)
+ENTRY_THRESHOLD=4.0
+STRONG_THRESHOLD=6.5
+VERY_STRONG_THRESHOLD=8.0
 
-ENTRY_THRESHOLD = 5.0
-STRONG_THRESHOLD = 7.0
-VERY_STRONG_THRESHOLD = 8.5
+if signed_signal >= VERY_STRONG_THRESHOLD: state,icon,cls="VERY STRONG SHORT","🔴","red"
+elif signed_signal >= STRONG_THRESHOLD: state,icon,cls="STRONG SHORT","🔴","red"
+elif signed_signal >= ENTRY_THRESHOLD: state,icon,cls="SHORT","🟠","orange"
+elif signed_signal <= -VERY_STRONG_THRESHOLD: state,icon,cls="VERY STRONG LONG","🟢","green"
+elif signed_signal <= -STRONG_THRESHOLD: state,icon,cls="STRONG LONG","🟢","green"
+elif signed_signal <= -ENTRY_THRESHOLD: state,icon,cls="LONG","🔵","blue"
+else: state,icon,cls="WAIT","⚪","white"
 
-if signed_signal >= VERY_STRONG_THRESHOLD:
-    state,icon,cls = "VERY STRONG SHORT","🔴","red"
-elif signed_signal >= STRONG_THRESHOLD:
-    state,icon,cls = "STRONG SHORT","🔴","red"
-elif signed_signal >= ENTRY_THRESHOLD:
-    state,icon,cls = "SHORT","🟠","orange"
-elif signed_signal <= -VERY_STRONG_THRESHOLD:
-    state,icon,cls = "VERY STRONG LONG","🟢","green"
-elif signed_signal <= -STRONG_THRESHOLD:
-    state,icon,cls = "STRONG LONG","🟢","green"
-elif signed_signal <= -ENTRY_THRESHOLD:
-    state,icon,cls = "LONG","🔵","blue"
-else:
-    state,icon,cls = "WAIT","🟡","yellow"
+# Strong labels require a matching divergence on 1H or 4H. 12H alone is only a bonus.
+if signal_score>=STRONG_THRESHOLD:
+    matching_div='bullish' if signed_signal>0 else 'bearish'
+    if DIV1!=matching_div and DIV4!=matching_div:
+        state,icon,cls="WAIT · חסר Divergence 1H/4H","⚪","white"
 
-# Strong labels require the defining reversal evidence.
-if signal_score >= STRONG_THRESHOLD:
-    matching_div = "bullish" if signed_signal > 0 else "bearish"
-    if matching_div not in (DIV4,DIV12):
-        state,icon,cls = "WAIT","🟡","yellow"
-
-# Gauge: -10 = LONG, 0 = neutral, +10 = SHORT.
 pos = max(2, min(98, (signed_signal+10)/20*100))
 if state == "WAIT":
     lean = "SHORT" if signed_signal > 0 else ("LONG" if signed_signal < 0 else "NEUTRAL")
@@ -1093,18 +1092,18 @@ st.markdown(f"""
 <div class="signal">
   <div class="signal-title {cls}">{icon} {state}</div>
   <div class="score">{score_line}</div>
-  <div class="confidence">סף חיפוש עסקה: <b>5.0/10</b> · כיסוי נתונים <b>{data_coverage:.0f}%</b></div>
+  <div class="confidence">סף חיפוש עסקה קצרה: <b>4.0/10</b> · כיסוי נתונים <b>{data_coverage:.0f}%</b></div>
   <div class="gauge-wrap">
     <div class="pointer" style="left:{pos:.1f}%"></div>
     <div class="gauge"><div class="midline"></div></div>
     <div class="gauge-labels"><span>LONG 10</span><span>WAIT 0</span><span>SHORT 10</span></div>
-    <div class="gauge-zones"><span>LONG ≤ -5</span><span>WAIT</span><span>SHORT ≥ +5</span></div>
+    <div class="gauge-zones"><span>LONG ≤ -4</span><span>WAIT</span><span>SHORT ≥ +4</span></div>
   </div>
 </div>
 """, unsafe_allow_html=True)
 
-st.caption(f"נתונים יומיים: {v.index[-1]:%d/%m/%Y} · נר סשן אחרון (זמן פתיחה, ניו יורק): {V12.index[-1]:%d/%m %H:%M} · נר 4H: {V4.index[-1]:%d/%m %H:%M}")
-st.caption("הנתונים היומיים מבוססים על הסשן האחרון שנסגר, וממתינים שעה לאחר הסגירה לפרסום. אין כאן מחירי זמן אמת. הציון הוא סכום משקלים, לא אחוז הצלחה. כיסוי הנתונים אינו מדד לאיכות העסקה. אין ביצוע עסקאות אוטומטי.")
+st.caption(f"VIX Daily: {v.index[-1]:%d/%m/%Y} · 1H: {V1H.index[-1]:%d/%m %H:%M} · 4H: {V4.index[-1]:%d/%m %H:%M} · 12H: {V12.index[-1]:%d/%m %H:%M}")
+st.caption("המודל משתמש בנרות סגורים בלבד ואינו זמן-אמת Tick-by-Tick. הציון הוא סכום משקלים, לא אחוז הצלחה. הוא מכוון לעסקאות קצרות יותר ולא לבניית Swing ארוך. אין ביצוע עסקאות אוטומטי.")
 if data_coverage < 100:
     missing = [name for name,x in [("VVIX",vv),("VIX1D",v1),("SKEW",skew),("COR1M",cor1m)] if x is None]
     st.warning("כיסוי חלקי — רכיבים חסרים או לא עדכניים: " + ", ".join(missing))
@@ -1125,134 +1124,90 @@ if driver_rows:
     )
 
 # Compact statuses
-ema_bias="SHORT" if VE9>VE26 else "LONG"
-ema_cls="red" if ema_bias=="SHORT" else "green"
-if CROSS and CROSS_AGE is not None and CROSS_AGE<=5:
-    cross_text=("Golden Cross" if CROSS=="golden" else "Death Cross")+" · קרבה 10/10"
-    cross_cls="red" if CROSS=="golden" else "green"
-elif APPROACH:
-    cross_text=("Golden מתקרב" if APPROACH=="golden" else "Death מתקרב")+f" · {CROSS_NEAR}/10"
-    cross_cls="orange" if APPROACH=="golden" else "blue"
-else:
-    cross_text=f"ללא חצייה · {CROSS_NEAR}/10"
-    cross_cls="white"
-
 def div_text(d):
     if d=="bullish": return "Bullish → SHORT","red"
     if d=="bearish": return "Bearish → LONG","green"
     return "אין","white"
 
-def sr_text(s):
-    return {
-        "reject_resistance":("התנגדות → SHORT","red"),
-        "breakout":("Breakout → LONG","green"),
-        "bounce_support":("תמיכה → LONG","green"),
-        "breakdown":("Breakdown → SHORT","red"),
-        "neutral":("ניטרלי","white")
-    }[s]
-
-def vix_sr_text(s):
-    return {
-        "reject_resistance":("התנגדות → LONG","green"),
-        "breakout":("Breakout → SHORT","red"),
-        "bounce_support":("תמיכה → SHORT","red"),
-        "breakdown":("Breakdown → LONG","green"),
-        "neutral":("ניטרלי","white")
-    }[s]
-
-def swing_text(s):
-    return {
-        "higher_high_rejection":("שיא עולה + דחייה → LONG","green"),
-        "lower_low_rebound":("שפל יורד + חזרה → SHORT","red"),
-        "none":("אין אישור","white")
-    }.get(s,("אין אישור","white"))
-
 def fib_text(f):
-    if not f.get("valid"):
-        return "אין Impulse ברור","white"
+    if not f.get("valid"): return "אין Impulse ברור","white"
     p=f["phase"]
     mapping={
-        "approaching_up":("VIX בדרך לאזור → SHORT Watch","orange"),
-        "approaching_down":("VIX בדרך לאזור → LONG Watch","blue"),
-        "decision_zone":("0.50–0.618 · DECISION ZONE","yellow"),
-        "reject_down":("דחייה מטה מהאזור → LONG","green"),
-        "rebound_up":("Rebound מהאזור → SHORT","red"),
-        "break_above_0618":("פריצה מעל 0.618 → SHORT","red"),
-        "break_below_0618":("שבירה מתחת 0.618 → LONG","green"),
-        "below_zone":("מתחת לאזור · ממתין למומנטום","white"),
-        "above_zone":("מעל לאזור · ממתין למומנטום","white"),
-        "tracking":("מעקב","white"),
-    }
+        "approaching_up":("VIX עולה לאזור · Watch SHORT","orange"),"approaching_down":("VIX יורד לאזור · Watch LONG","blue"),
+        "decision_zone":("0.50–0.618 · Decision Zone","yellow"),"reject_down":("דחייה מטה → LONG","green"),
+        "rebound_up":("Rebound מעלה → SHORT","red"),"break_above_0618":("פריצה 0.618 → SHORT","red"),
+        "break_below_0618":("שבירה 0.618 → LONG","green"),"below_zone":("מתחת לאזור","white"),
+        "above_zone":("מעל לאזור","white"),"tracking":("מעקב","white")}
     return mapping.get(p,(p,"white"))
+
+def pat_text(p):
+    if p.get('bias')=='bullish': return f"{p['pattern']} → SHORT","red"
+    if p.get('bias')=='bearish': return f"{p['pattern']} → LONG","green"
+    return "אין תבנית מאושרת","white"
+
+def srzone_text(z):
+    if z['state']=='support': return f"תמיכה · {z['support_touches']} נגיעות → SHORT","red"
+    if z['state']=='resistance': return f"התנגדות · {z['resistance_touches']} נגיעות → LONG","green"
+    return "אין אזור רב-נגיעות פעיל","white"
 
 def institutional_text(v):
     if v>=0.45: return f"Pressure {v:+.2f}/2.5 → SHORT","red"
     if v<=-0.45: return f"Relief {v:+.2f}/2.5 → LONG","green"
     return f"Neutral {v:+.2f}/2.5","white"
 
-d4,d4c=div_text(DIV4); d12,d12c=div_text(DIV12); srt,src=sr_text(SR); vsrt,vsrc=vix_sr_text(VIX_SR)
-swingt,swingc=swing_text(SWING12); instt,instc=institutional_text(category_scores["Institutional"])
-fibt,fibc=fib_text(FIB12)
+d1,d1c=div_text(DIV1); d4,d4c=div_text(DIV4); d12,d12c=div_text(DIV12)
+f4t,f4c=fib_text(FIB4); f12t,f12c=fib_text(FIB12)
+p1t,p1c=pat_text(PAT1); p4t,p4c=pat_text(PAT4)
+sr4t,sr4c=srzone_text(SR4); sr12t,sr12c=srzone_text(SR12)
+instt,instc=institutional_text(category_scores["Institutional"])
 term_text="Risk-Off" if R3>=1.02 else ("Risk-On" if R3<=0.94 else "ניטרלי")
 term_cls="red" if R3>=1.02 else ("green" if R3<=0.94 else "white")
 
 st.markdown('<div class="status-grid">'+
-    status_row("Divergence 12H · HIGH WEIGHT",d12,d12c)+
-    status_row("Divergence 4H",d4,d4c)+
-    status_row("VIX Swing Structure · 12H",swingt,swingc)+
-    status_row("Smart Fib 0.50–0.618 · 12H",fibt,fibc)+
+    status_row("Divergence 1H · FAST TRIGGER",d1,d1c)+
+    status_row("Divergence 4H · MAIN CONFIRM",d4,d4c)+
+    status_row("Divergence 12H · BONUS",d12,d12c)+
+    status_row("Pattern 1H · W/M/Wedge",p1t,p1c)+
+    status_row("Pattern 4H · W/M/Wedge",p4t,p4c)+
+    status_row("Repeated S/R · 4H",sr4t,sr4c)+
+    status_row("Smart Fib · 4H",f4t,f4c)+
+    status_row("Repeated S/R · 12H",sr12t,sr12c)+
+    status_row("Smart Fib · 12H",f12t,f12c)+
     status_row("Institutional Vol Pressure",instt,instc)+
-    status_row("VIX S/R · 12H",vsrt,vsrc)+
-    status_row(f"{market_name} S/R · 12H",srt,src)+
     status_row("Term Structure",term_text,term_cls)+
     status_row("VIX9D / VIX",("לחץ" if R9>=1.03 else ("רגוע" if R9<=0.97 else "מאוזן")),"red" if R9>=1.03 else ("green" if R9<=0.97 else "white"))+
-    status_row("EMA9/26 · 12H · LOW WEIGHT",ema_bias,ema_cls)+
-    status_row("Cross · EMA9/26",cross_text,cross_cls)+
     '</div>',unsafe_allow_html=True)
 
-# Smart Fib detail panel
-if FIB12.get("valid"):
-    arrow="↓" if FIB12["direction"]=="down" else "↑"
-    st.markdown(
-        f'<div class="panel"><b>Smart Fib 12H {arrow}</b><br>'
-        f'Impulse: <bdi dir="ltr">{FIB12["start"]:.2f} → {FIB12["end"]:.2f}</bdi> · '
-        f'אזור החלטה <bdi dir="ltr">0.50–0.618 = {FIB12["zone_low"]:.2f}–{FIB12["zone_high"]:.2f}</bdi><br>'
-        f'VIX נוכחי <bdi dir="ltr">{FIB12["current"]:.2f}</bdi> · {fibt} · '
-        f'אישורי עלייה <bdi dir="ltr">{rise_conf}/6</bdi> · אישורי ירידה <bdi dir="ltr">{fall_conf}/6</bdi><br>'
-        '<span class="muted">הפיבונאצ׳י הוא אזור יעד/תגובה בלבד. ניקוד ניתן רק עם לפחות 2 אישורים נוספים.</span></div>',
-        unsafe_allow_html=True
-    )
+# Smart Fib detail panels
+for tf,f,z in [("4H",FIB4,SR4),("12H",FIB12,SR12)]:
+    if f.get("valid"):
+        arrow="↓" if f["direction"]=="down" else "↑"; ft,_=fib_text(f)
+        zone_note=(f"תמיכה {z['support_touches']} נגיעות" if z['state']=='support' else (f"התנגדות {z['resistance_touches']} נגיעות" if z['state']=='resistance' else "ללא S/R רב-נגיעות פעיל"))
+        st.markdown(f'<div class="panel"><b>Smart Fib {tf} {arrow}</b><br>Impulse: <bdi dir="ltr">{f["start"]:.2f} → {f["end"]:.2f}</bdi> · אזור <bdi dir="ltr">0.50–0.618 = {f["zone_low"]:.2f}–{f["zone_high"]:.2f}</bdi><br>VIX <bdi dir="ltr">{f["current"]:.2f}</bdi> · {ft} · {zone_note}<br><span class="muted">Fib לבדו לא נותן כניסה; נדרש אישור Divergence / תבנית / אזור רב-נגיעות.</span></div>',unsafe_allow_html=True)
 
 # Minimal execution reminder
-if "SHORT" in state: action="חפש אישור SHORT במדד שנבחר; זה אינו אישור כניסה אוטומטי"
-elif "LONG" in state: action="חפש אישור LONG במדד שנבחר; זה אינו אישור כניסה אוטומטי"
+if "SHORT" in state: action="חפש טריגר SHORT קצר ב-QQQ/Nasdaq; זה אינו אישור כניסה אוטומטי"
+elif "LONG" in state: action="חפש טריגר LONG קצר ב-QQQ/Nasdaq; זה אינו אישור כניסה אוטומטי"
 else: action="אין עסקה — המתן לסנכרון"
 st.markdown(f'<div class="panel" style="text-align:center;font-weight:900">{action}</div>',unsafe_allow_html=True)
 
 with st.expander("פירוט החישוב"):
-    st.write("**תקרות משקל בקירוב (לא אחוזי הצלחה):** VIX Divergence/Structure + Smart Fib ~45–50% · Institutional Vol 25% · Vol Curve 15% · Market Confirmation 10% · EMA9/26 5%")
-    st.caption("Smart Fib נוסף כרכיב תומך בלבד (עד ±0.55) ודורש לפחות שני אישורים נוספים. אין כאן טענה לרווחיות או לכיול אופטימלי ללא בק־טסט/Forward Test ייעודי.")
-    st.write(f"VIX 12H {V12_LAST:.2f} · EMA9 {VE9:.2f} · EMA26 {VE26:.2f} · Cross proximity {CROSS_NEAR}/10")
-    st.write(f"Divergence: 4H={DIV4} · 12H={DIV12} · Swing 12H={SWING12}")
+    st.write("**מבנה המשקל החדש:** Divergence 1H+4H הוא הליבה; 12H בונוס. Fib נבדק ב-4H/12H ורק עם אישורים. תבניות W/M/יתד נבדקות ב-1H/4H. אין יותר Market Confirmation ואין EMA.")
+    st.write(f"Divergence: 1H={DIV1} · 4H={DIV4} · 12H={DIV12}")
+    st.write(f"Pattern: 1H={PAT1['pattern']} ({PAT1['bias']}) · 4H={PAT4['pattern']} ({PAT4['bias']})")
+    st.write(f"Repeated S/R 4H: {SR4['state']} · support touches={SR4['support_touches']} · resistance touches={SR4['resistance_touches']}")
+    st.write(f"Repeated S/R 12H: {SR12['state']} · support touches={SR12['support_touches']} · resistance touches={SR12['resistance_touches']}")
+    if FIB4.get('valid'): st.write(f"Smart Fib 4H: {FIB4['direction']} · {FIB4['phase']} · zone {FIB4['zone_low']:.2f}–{FIB4['zone_high']:.2f}")
+    if FIB12.get('valid'): st.write(f"Smart Fib 12H: {FIB12['direction']} · {FIB12['phase']} · zone {FIB12['zone_low']:.2f}–{FIB12['zone_high']:.2f}")
     st.write(f"VIX 1D {C1:+.2f}% · 5D {C5:+.2f}% · VIX9D/VIX {R9:.3f} · VIX/VIX3M {R3:.3f}")
-    if np.isfinite(V1):
-        st.write(f"VIX1D {V1:.2f} · VIX1D/VIX {R1:.3f} · VIX1D/VIX9D {R1_9:.3f}")
-    if np.isfinite(VV):
-        st.write(f"VVIX {VV:.2f} · VVIX/VIX z-score {VV_Z:+.2f} · Relative 5D momentum {VV_REL:+.2f}pp")
-    if np.isfinite(SKEW):
-        st.write(f"SKEW {SKEW:.2f} · 5D {SKEW5:+.2f}% · z-score {SKEW_Z:+.2f}")
-    if np.isfinite(COR1M):
-        st.write(f"COR1M {COR1M:.2f} · 5D {COR5:+.2f}% · z-score {COR_Z:+.2f}")
-    st.write(f"{market_name}: מומנטום 2D {M2:+.2f}% · 5D {M5:+.2f}% · S/R 12H: {SR} · תמיכה {SUPPORT:.2f} · התנגדות {RESISTANCE:.2f}")
-    st.write(f"VIX S/R 12H: {VIX_SR} · תמיכה {VIX_SUPPORT:.2f} · התנגדות {VIX_RESISTANCE:.2f}")
-    if FIB12.get("valid"):
-        st.write(f"Smart Fib 12H: direction={FIB12['direction']} · phase={FIB12['phase']} · anchor {FIB12['start']:.2f}→{FIB12['end']:.2f} · zone {FIB12['zone_low']:.2f}–{FIB12['zone_high']:.2f} · rise_conf={rise_conf}/6 · fall_conf={fall_conf}/6")
+    if np.isfinite(V1): st.write(f"VIX1D {V1:.2f} · VIX1D/VIX {R1:.3f} · VIX1D/VIX9D {R1_9:.3f}")
+    if np.isfinite(VV): st.write(f"VVIX {VV:.2f} · VVIX/VIX z-score {VV_Z:+.2f} · Relative 5D momentum {VV_REL:+.2f}pp")
+    if np.isfinite(SKEW): st.write(f"SKEW {SKEW:.2f} · 5D {SKEW5:+.2f}% · z-score {SKEW_Z:+.2f}")
+    if np.isfinite(COR1M): st.write(f"COR1M {COR1M:.2f} · 5D {COR5:+.2f}% · z-score {COR_Z:+.2f}")
     st.write(f"כיסוי נתונים: {data_coverage:.0f}% · Institutional availability {institutional_available:.1f}/{institutional_total:.1f}")
-    st.write("RSI עצמו אינו מקבל נקודות. רק Divergence מאומת מקבל משקל, כדי להימנע מ-RSI overbought/oversold פשוט שעלול להטעות ב-VIX.")
-    st.write(f"ציון משוקלל נטו: {score:+.2f} → עוצמת איתות {signal_score:.2f}/10 · כיוון: {'SHORT' if signed_signal>0 else ('LONG' if signed_signal<0 else 'NEUTRAL')}")
-    st.write("**ציוני קטגוריות:** " + " · ".join([f"{k}: {v:+.2f}" for k,v in category_scores.items()]))
-    for pts,txt,cat in sorted(reasons,key=lambda z:abs(z[0]),reverse=True):
-        st.write(f"**{pts:+.2f}** — {txt}  ·  _{cat}_")
+    st.write(f"ציון נטו: {score:+.2f} → עוצמת איתות {signal_score:.2f}/10 · כיוון: {'SHORT' if signed_signal>0 else ('LONG' if signed_signal<0 else 'NEUTRAL')}")
+    st.write("**ציוני קטגוריות:** "+" · ".join([f"{k}: {v:+.2f}" for k,v in category_scores.items()]))
+    for pts,txt,cat in sorted(reasons,key=lambda z:abs(z[0]),reverse=True): st.write(f"**{pts:+.2f}** — {txt} · _{cat}_")
 
 with st.expander("מקורות נתונים / גיבוי"):
     st.write(f"VIX Daily: **{source_name(v)}**")
@@ -1262,10 +1217,8 @@ with st.expander("מקורות נתונים / גיבוי"):
     st.write(f"VIX1D Daily: **{source_name(v1)}**")
     st.write(f"SKEW Daily: **{source_name(skew)}**")
     st.write(f"COR1M Daily: **{source_name(cor1m)}**")
-    st.write(f"{market_name} Daily: **{source_name(m)}**")
     st.write(f"VIX Close 60m: **{source_name(v_intra)}**")
     st.write(f"VIX OHLC 60m: **{source_name(vo_intra)}**")
-    st.write(f"{market_name} 60m: **{source_name(m_intra)}**")
-    st.caption("גיבוי אמיתי: Yahoo/yfinance → Yahoo Chart API ישיר → Cboe הרשמי למדדי תנודתיות/אופציות. FRED משמש ל-VIX/VIX3M במידת הצורך, ו-Stooq למדדי NDX/SPX. רכיב Institutional הוא אופציונלי: מקור חסר מוריד Data Coverage ואינו מוחלף בנתון מומצא.")
+    st.caption("גיבוי אמיתי: Yahoo/yfinance → Yahoo Chart API ישיר → Cboe הרשמי למדדי תנודתיות/אופציות. FRED משמש ל-VIX/VIX3M במידת הצורך. רכיב Institutional הוא אופציונלי: מקור חסר מוריד Data Coverage ואינו מוחלף בנתון מומצא.")
 
-st.caption(f"עודכן {pd.Timestamp.now(tz='Asia/Jerusalem').strftime('%H:%M')} · v10.7 Smart Fib · שעון ישראל · Multi-Source + Retry פעיל · כלי מחקרי, לא ייעוץ השקעות")
+st.caption(f"עודכן {pd.Timestamp.now(tz='Asia/Jerusalem').strftime('%H:%M')} · v10.8 Tactical Short Trade · שעון ישראל · Multi-Source + Retry פעיל · כלי מחקרי, לא ייעוץ השקעות")
