@@ -852,7 +852,7 @@ def detect_clear_pattern(df, lookback=42, pivot=2):
 def status_row(name,value,cls="white"):
     return f'<div class="status"><div class="status-name"><bdi>{name}</bdi></div><div class="status-val {cls}"><bdi>{value}</bdi></div></div>'
 
-st.markdown('<div class="hero"><div class="hero-title">🎯 VIX Tactical</div><div class="muted">עסקאות קצרות · 1H טריגר · 4H אישור · 12H כיוון/בונוס · v10.9</div></div>',unsafe_allow_html=True)
+st.markdown('<div class="hero"><div class="hero-title">🎯 VIX Tactical</div><div class="muted">עסקאות קצרות · 1H טריגר · 4H אישור · 12H כיוון/בונוס · v10.10</div></div>',unsafe_allow_html=True)
 if st.button("🔄 רענן",use_container_width=True): st.cache_data.clear(); st.rerun()
 
 st.markdown('<div class="panel" dir="rtl"><bdi dir="ltr">LONG</bdi> — חיפוש עלייה ב-QQQ/Nasdaq · <bdi dir="ltr">SHORT</bdi> — חיפוש ירידה ב-QQQ/Nasdaq<br><span class="muted">אין יותר ניקוד או אישור מה-Nasdaq/S&P עצמם. הכיוון נגזר מה-VIX בלבד.</span></div>', unsafe_allow_html=True)
@@ -925,7 +925,7 @@ def directional_context_12h(df):
     c = pd.to_numeric(df["Close"], errors="coerce").dropna()
     if len(c) < 10:
         return "neutral"
-    r = rsi(c, 14).dropna()
+    r = rsi_series(c, 14).dropna()
     if len(r) < 4:
         return "neutral"
     price_move = float(c.iloc[-1] / c.iloc[-4] - 1.0)
@@ -1032,7 +1032,7 @@ def score_fib(f,z,tf,base,react):
 score_fib(FIB4,SR4,'4H',0.45,0.75)
 score_fib(FIB12,SR12,'12H',0.25,0.45)
 
-# v10.9 Reference Setup: complete 4H scalp setup can stand on its own.
+# Reference Setup inherited from v10.9: complete 4H scalp setup can stand on its own.
 def fib_is_confirmed_for(direction):
     if not FIB4.get("valid") or not fib_repeated_level_overlap(FIB4, SR4):
         return False
@@ -1296,4 +1296,4 @@ with st.expander("מקורות נתונים / גיבוי"):
     st.write(f"VIX OHLC 60m: **{source_name(vo_intra)}**")
     st.caption("גיבוי אמיתי: Yahoo/yfinance → Yahoo Chart API ישיר → Cboe הרשמי למדדי תנודתיות/אופציות. FRED משמש ל-VIX/VIX3M במידת הצורך. רכיב Institutional הוא אופציונלי: מקור חסר מוריד Data Coverage ואינו מוחלף בנתון מומצא.")
 
-st.caption(f"עודכן {pd.Timestamp.now(tz='Asia/Jerusalem').strftime('%H:%M')} · v10.8 Tactical Short Trade · שעון ישראל · Multi-Source + Retry פעיל · כלי מחקרי, לא ייעוץ השקעות")
+st.caption(f"עודכן {pd.Timestamp.now(tz='Asia/Jerusalem').strftime('%H:%M')} · v10.10 Fast Pressure · שעון ישראל · Multi-Source + Retry פעיל · כלי מחקרי, לא ייעוץ השקעות")
