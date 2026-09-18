@@ -856,15 +856,145 @@ def detect_clear_pattern(df, lookback=42, pivot=2):
             return {"pattern":"Bullish Wedge","bias":"bullish","detail":"יתד יורדת/שורית מאושרת בפריצה מעלה"}
     return out
 
+
+def detect_wedge_setup(df, lookback=55, pivot=2):
+    """Detect a developing or confirmed wedge without waiting for a late pivot.
+
+    This is intentionally used as an *early structure* detector. A developing rising
+    wedge on VIX is bearish for VIX (QQQ/Nasdaq LONG watch); a developing falling
+    wedge is bullish for VIX (QQQ/Nasdaq SHORT watch). A breakout upgrades the setup.
+    """
+    out={"pattern":"none","bias":"none","confirmed":False,"detail":""}
+    x=clean_history(df)
+    if x is None or len(x)<24:
+        return out
+    x=x.iloc[-lookback:].copy()
+    highs=[]; lows=[]
+    for i in range(pivot,len(x)-pivot):
+        wh=x['High'].iloc[i-pivot:i+pivot+1]
+        wl=x['Low'].iloc[i-pivot:i+pivot+1]
+        if x['High'].iloc[i]==wh.max() and (wh==x['High'].iloc[i]).sum()==1:
+            highs.append((i,float(x['High'].iloc[i])))
+        if x['Low'].iloc[i]==wl.min() and (wl==x['Low'].iloc[i]).sum()==1:
+            lows.append((i,float(x['Low'].iloc[i])))
+    if len(highs)<3 or len(lows)<3:
+        return out
+    hh=highs[-4:]; ll=lows[-4:]
+    hx=np.array([a for a,_ in hh],float); hy=np.array([b for _,b in hh],float)
+    lx=np.array([a for a,_ in ll],float); ly=np.array([b for _,b in ll],float)
+    hs,hi=np.polyfit(hx,hy,1); ls,li=np.polyfit(lx,ly,1)
+    n=len(x)-1
+    upper_now=hs*n+hi; lower_now=ls*n+li
+    n0=max(0,n-14); upper_old=hs*n0+hi; lower_old=ls*n0+li
+    width_old=upper_old-lower_old; width_now=upper_now-lower_now
+    # Setup detection is looser than confirmed-pattern detection, but still requires
+    # real convergence and same-direction boundaries.
+    converging=width_old>0 and width_now>0 and width_now<=width_old*0.90
+    close=float(x['Close'].iloc[-1])
+    if converging and hs>0 and ls>0 and ls>hs:
+        confirmed=close<lower_now*0.998
+        return {"pattern":"Rising Wedge","bias":"bearish","confirmed":bool(confirmed),
+                "detail":"יתד עולה/דובית " + ("מאושרת בשבירה מטה" if confirmed else "בבנייה")}
+    if converging and hs<0 and ls<0 and hs>ls:
+        confirmed=close>upper_now*1.002
+        return {"pattern":"Falling Wedge","bias":"bullish","confirmed":bool(confirmed),
+                "detail":"יתד יורדת/שורית " + ("מאושרת בפריצה מעלה" if confirmed else "בבנייה")}
+    return out
+
+
+def recent_zone_overlap(df, low, high, recent_bars=8, pad_pct=0.6):
+    """Whether a recent closed candle overlapped a price zone."""
+    x=clean_history(df)
+    if x is None or not np.isfinite(low) or not np.isfinite(high):
+        return False
+    zlo=min(float(low),float(high)); zhi=max(float(low),float(high))
+    pad=max(0.03,((zlo+zhi)/2.0)*pad_pct/100.0)
+    r=x.iloc[-recent_bars:]
+    return bool(((r['High']>=zlo-pad)&(r['Low']<=zhi+pad)).any())
+
+
+def recent_level_rejection(df, level, side='resistance', recent_bars=8, tol_pct=1.25):
+    """Detect a recent closed-candle rejection from a repeated S/R level."""
+    x=clean_history(df)
+    if x is None or not np.isfinite(level) or len(x)<4:
+        return False
+    r=x.iloc[-recent_bars:]
+    level=float(level); tol=tol_pct/100.0
+    if side=='resistance':
+        touched=(r['High']>=level*(1-tol))
+        rejected=touched & (r['Close']<level*(1-0.002)) & (r['Close']<r['Open'])
+        if bool(rejected.any()): return True
+        # Also retain the event after price has already moved away from the zone.
+        if bool(touched.any()) and float(r['Close'].iloc[-1])<level*(1-0.02): return True
+    else:
+        touched=(r['Low']<=level*(1+tol))
+        rejected=touched & (r['Close']>level*(1+0.002)) & (r['Close']>r['Open'])
+        if bool(rejected.any()): return True
+        if bool(touched.any()) and float(r['Close'].iloc[-1])>level*(1+0.02): return True
+    return False
+
+
+def reversal_confluence_12h(df, sr, fib, wedge):
+    """12H early-warning engine.
+
+    Core WATCH requires three independent location/structure facts:
+      1) repeated S/R with >=3 touches,
+      2) a recent Smart-Fib 0.50-0.618 overlap in the correct retracement direction,
+      3) a developing/confirmed wedge in the reversal direction.
+    Rejection is tracked separately and can upgrade WATCH to DEVELOPING together
+    with 4H confirmation later in the pipeline.
+    """
+    out={"direction":"none","stage":"NONE","sr_ok":False,"fib_ok":False,
+         "wedge_ok":False,"rejection":False,"detail":""}
+    x=clean_history(df)
+    if x is None or not fib.get('valid'):
+        return out
+
+    # VIX bearish reversal -> QQQ/Nasdaq LONG.
+    if fib.get('direction')=='down' and wedge.get('bias')=='bearish':
+        level=sr.get('resistance',np.nan); touches=sr.get('resistance_touches',0)
+        sr_ok=bool(touches>=3 and np.isfinite(level) and recent_zone_overlap(x,level,level,8,1.25))
+        fib_ok=recent_zone_overlap(x,fib.get('zone_low',np.nan),fib.get('zone_high',np.nan),8,0.6)
+        rejection=recent_level_rejection(x,level,'resistance',8,1.25) if sr_ok else False
+        if sr_ok and fib_ok:
+            return {"direction":"LONG","stage":"WATCH","sr_ok":True,"fib_ok":True,
+                    "wedge_ok":True,"rejection":bool(rejection),
+                    "detail":f"12H: התנגדות {touches} נגיעות + Fib 0.50–0.618 + Rising Wedge"}
+
+    # VIX bullish reversal -> QQQ/Nasdaq SHORT.
+    if fib.get('direction')=='up' and wedge.get('bias')=='bullish':
+        level=sr.get('support',np.nan); touches=sr.get('support_touches',0)
+        sr_ok=bool(touches>=3 and np.isfinite(level) and recent_zone_overlap(x,level,level,8,1.25))
+        fib_ok=recent_zone_overlap(x,fib.get('zone_low',np.nan),fib.get('zone_high',np.nan),8,0.6)
+        rejection=recent_level_rejection(x,level,'support',8,1.25) if sr_ok else False
+        if sr_ok and fib_ok:
+            return {"direction":"SHORT","stage":"WATCH","sr_ok":True,"fib_ok":True,
+                    "wedge_ok":True,"rejection":bool(rejection),
+                    "detail":f"12H: תמיכה {touches} נגיעות + Fib 0.50–0.618 + Falling Wedge"}
+    return out
+
+
+def four_hour_followthrough(df, direction):
+    """Conservative closed-candle follow-through check used only for ENTRY READY."""
+    x=clean_history(df)
+    if x is None or len(x)<5:
+        return False
+    c=x['Close']; h=x['High']; l=x['Low']
+    if direction=='LONG':  # Want VIX continuing down.
+        return bool(c.iloc[-1]<c.iloc[-2] and c.iloc[-1]<=l.iloc[-3:-1].min()*1.002)
+    if direction=='SHORT': # Want VIX continuing up.
+        return bool(c.iloc[-1]>c.iloc[-2] and c.iloc[-1]>=h.iloc[-3:-1].max()*0.998)
+    return False
+
 def status_row(name,value,cls="white"):
     return f'<div class="status"><div class="status-name"><bdi>{name}</bdi></div><div class="status-val {cls}"><bdi>{value}</bdi></div></div>'
 
-st.markdown('<div class="hero"><div class="hero-title">🎯 VIX Tactical</div><div class="muted">עסקאות קצרות · 1H טריגר · 4H אישור · 12H כיוון/בונוס · v11.1</div></div>',unsafe_allow_html=True)
+st.markdown('<div class="hero"><div class="hero-title">🎯 VIX Tactical</div><div class="muted">עסקאות קצרות · 1H טריגר · 4H אישור · 12H Reversal Engine · v11.2</div></div>',unsafe_allow_html=True)
 if st.button("🔄 רענן",use_container_width=True): st.cache_data.clear(); st.rerun()
 
 st.markdown('<div class="panel" dir="rtl"><bdi dir="ltr">LONG</bdi> — חיפוש עלייה ב-QQQ/Nasdaq · <bdi dir="ltr">SHORT</bdi> — חיפוש ירידה ב-QQQ/Nasdaq<br><span class="muted">אין יותר ניקוד או אישור מה-Nasdaq/S&P עצמם. הכיוון נגזר מה-VIX בלבד.</span></div>', unsafe_allow_html=True)
 with st.expander("איך לקרוא את האיתות והזמנים"):
-    st.markdown('<div dir="rtl">המודל מיועד לסקאלפ/עסקאות קצרות: <bdi dir="ltr">4H</bdi> הוא גרף ה-Setup המרכזי, <bdi dir="ltr">1H</bdi> משמש לטריגר ותזמון, ו-<bdi dir="ltr">12H</bdi> משמש לכיוון/בונוס ואינו חייב Divergence. החישוב משתמש בנרות סגורים בלבד. סיכומי 4H/12H נוצרים מנתוני שעה זמינים ולכן הם סיכומי סשן ולא נרות בורסה מקוריים.</div>',unsafe_allow_html=True)
+    st.markdown('<div dir="rtl">המודל מיועד לסקאלפ/עסקאות קצרות: <bdi dir="ltr">4H</bdi> הוא גרף ה-Setup המרכזי, <bdi dir="ltr">1H</bdi> משמש לתזמון, ו-<bdi dir="ltr">12H</bdi> מפעיל גם מנוע Reversal Confluence. שילוב של S/R רב-נגיעות + Fib + יתד + דחייה יכול להעלות WATCH עוד לפני Entry. החישוב משתמש בנרות סגורים בלבד. סיכומי 4H/12H נוצרים מנתוני שעה זמינים ולכן הם סיכומי סשן ולא נרות בורסה מקוריים.</div>',unsafe_allow_html=True)
 
 with st.spinner("בודק נתוני VIX ומחשב… מקור שאינו מגיב עלול להאריך את הטעינה"):
     v=fetch_close("^VIX",period="6mo")
@@ -952,6 +1082,11 @@ FIB4=smart_fib_state(VO4,lookback=60,pivot=2,min_impulse_pct=5.0)
 FIB12=smart_fib_state(VO12,lookback=55,pivot=2,min_impulse_pct=7.0)
 PAT1=detect_clear_pattern(VO1H,lookback=48,pivot=2)
 PAT4=detect_clear_pattern(VO4,lookback=42,pivot=2)
+PAT12=detect_clear_pattern(VO12,lookback=46,pivot=2)
+WEDGE12=detect_wedge_setup(VO12,lookback=55,pivot=2)
+# Small 4H divergence is an enhancer only; strict DIV4 remains the main confirmation.
+DIV4_EARLY=detect_divergence(V4, lookback=60, pivot=2, min_sep=3, min_price_pct=0.25, min_rsi_delta=1.5, recent_bars=10)
+REV12=reversal_confluence_12h(VO12,SR12,FIB12,WEDGE12)
 
 
 def directional_context_12h(df):
@@ -1005,7 +1140,7 @@ VIX_RV_24H=float(_v1h_ret.iloc[-24:].std(ddof=0)*np.sqrt(24)) if len(_v1h_ret)>=
 VIX_RV_RATIO=(VIX_RV_6H/VIX_RV_24H) if np.isfinite(VIX_RV_6H) and np.isfinite(VIX_RV_24H) and VIX_RV_24H>0 else np.nan
 
 score=0.0; reasons=[]
-category_scores={"VIX Tactical":0.0,"Institutional":0.0,"Vol Curve":0.0,"Regime":0.0}
+category_scores={"VIX Tactical":0.0,"12H Reversal":0.0,"Institutional":0.0,"Vol Curve":0.0,"Regime":0.0}
 
 def addcat(cat,p,t):
     global score
@@ -1081,6 +1216,32 @@ def score_fib(f,z,tf,base,react):
 
 score_fib(FIB4,SR4,'4H',0.45,0.75)
 score_fib(FIB12,SR12,'12H',0.15,0.25)
+
+
+# v11.2 12H Reversal Confluence Engine — early warning before the classic 4H entry.
+# The 12H structure can now create WATCH/DEVELOPING status, but cannot become
+# ENTRY READY without a closed-candle 4H continuation confirmation.
+if REV12.get('stage')=='WATCH':
+    rev_sign=-1.0 if REV12.get('direction')=='LONG' else 1.0
+    addcat("12H Reversal",1.10*rev_sign,
+           f"👀 12H REVERSAL WATCH: {REV12.get('detail','')} → QQQ/Nasdaq {REV12.get('direction')}")
+    if REV12.get('rejection'):
+        addcat("12H Reversal",0.45*rev_sign,"12H rejection מאזור S/R+Fib → ה-Reversal מתחיל לקבל אישור")
+    # A small 4H divergence is useful here only because higher-timeframe confluence already exists.
+    early_match = (REV12.get('direction')=='LONG' and DIV4_EARLY=='bearish') or (REV12.get('direction')=='SHORT' and DIV4_EARLY=='bullish')
+    strict_match = (REV12.get('direction')=='LONG' and DIV4=='bearish') or (REV12.get('direction')=='SHORT' and DIV4=='bullish')
+    wedge_break = bool(WEDGE12.get('confirmed'))
+    if early_match and not strict_match:
+        addcat("12H Reversal",0.35*rev_sign,"4H Early RSI Divergence קטן מאשר את ה-12H Reversal")
+    if REV12.get('rejection') or strict_match or early_match or wedge_break:
+        REV12['stage']='DEVELOPING'
+        addcat("12H Reversal",0.55*rev_sign,"⚡ DEVELOPING: 12H confluence + rejection/break/divergence ב-4H")
+    # ENTRY READY is deliberately stricter: closed 4H follow-through plus a concrete 4H structure reaction.
+    fourh_structure = ((REV12.get('direction')=='LONG' and (PAT4.get('bias')=='bearish' or FIB4.get('phase')=='reject_down')) or
+                       (REV12.get('direction')=='SHORT' and (PAT4.get('bias')=='bullish' or FIB4.get('phase')=='rebound_up')))
+    if REV12.get('stage')=='DEVELOPING' and fourh_structure and four_hour_followthrough(VO4,REV12.get('direction')):
+        REV12['stage']='ENTRY_READY'
+        addcat("12H Reversal",0.55*rev_sign,"✅ ENTRY READY: סגירת 4H + המשכיות מאשרות את ה-Reversal")
 
 # Reference Setup inherited from v10.9: complete 4H scalp setup can stand on its own.
 def fib_is_confirmed_for(direction):
@@ -1218,7 +1379,7 @@ VERY_STRONG_THRESHOLD=8.0
 
 # Conflict gate: a high raw score is not enough if the tactical core and fast institutional
 # pressure point in opposite directions. This reduces false confidence in scalp entries.
-tactical_score=category_scores["VIX Tactical"]
+tactical_score=category_scores["VIX Tactical"] + category_scores["12H Reversal"]
 fast_score=category_scores["Institutional"]
 core_conflict = (tactical_score*fast_score < 0 and abs(tactical_score)>=2.0 and abs(fast_score)>=0.75)
 if core_conflict:
@@ -1245,14 +1406,33 @@ elif signed_signal <= -STRONG_THRESHOLD: state,icon,cls="STRONG LONG","🟢","gr
 elif signed_signal <= -ENTRY_THRESHOLD: state,icon,cls="LONG","🔵","blue"
 else: state,icon,cls="WAIT","⚪","white"
 
-# Strong requires matching divergence on 1H or 4H. Complete 4H Reference Setup can stand alone; 12H divergence is not mandatory.
+# Strong normally requires matching divergence on 1H/4H. v11.2 exception: a DEVELOPING/ENTRY_READY
+# 12H Reversal Confluence with wedge + S/R + Fib can substitute because it already contains
+# independent higher-timeframe structure; WATCH alone is never enough for this exception.
 if signal_score>=STRONG_THRESHOLD:
     matching_div='bullish' if signed_signal>0 else 'bearish'
-    if DIV1!=matching_div and DIV4!=matching_div:
+    rev_override = REV12.get('stage') in ('DEVELOPING','ENTRY_READY') and ((signed_signal<0 and REV12.get('direction')=='LONG') or (signed_signal>0 and REV12.get('direction')=='SHORT'))
+    if DIV1!=matching_div and DIV4!=matching_div and not rev_override:
         state,icon,cls="WAIT · חסר Divergence 1H/4H","⚪","white"
 
+# Stage-aware early warning. This is deliberately separate from the raw score so a high-quality
+# 12H setup is visible before it reaches the normal 4.0/10 entry threshold. Major conflict blocks
+# an ENTRY READY label but not the WATCH information.
+rev_dir=REV12.get('direction')
+rev_stage=REV12.get('stage')
+rev_sign=-1 if rev_dir=='LONG' else (1 if rev_dir=='SHORT' else 0)
+rev_agrees=(rev_sign!=0 and signed_signal*rev_sign>0)
+if rev_stage=='ENTRY_READY' and rev_agrees and not core_conflict and signal_score>=3.5:
+    state,icon,cls=f"ENTRY READY · {rev_dir}","✅","green" if rev_dir=='LONG' else "red"
+elif rev_stage=='DEVELOPING' and rev_agrees and not core_conflict:
+    state,icon,cls=f"DEVELOPING · {rev_dir}","⚡","green" if rev_dir=='LONG' else "orange"
+elif rev_stage=='WATCH' and not core_conflict and (rev_agrees or signal_score<ENTRY_THRESHOLD):
+    state,icon,cls=f"WATCH · {rev_dir}","👀","blue" if rev_dir=='LONG' else "orange"
+elif rev_stage in ('WATCH','DEVELOPING','ENTRY_READY') and core_conflict:
+    state,icon,cls=f"WATCH · {rev_dir} · MIXED","⚠️","yellow"
+
 pos = max(2, min(98, (signed_signal+10)/20*100))
-if state == "WAIT":
+if state.startswith("WAIT"):
     lean = "SHORT" if signed_signal > 0 else ("LONG" if signed_signal < 0 else "NEUTRAL")
     score_line = f"עוצמת איתות <b>{signal_score:.1f}/10</b> · נטייה {lean}"
 else:
@@ -1343,6 +1523,18 @@ def pat_text(p):
     if p.get('bias')=='bearish': return f"{p['pattern']} → LONG","green"
     return "אין תבנית מאושרת","white"
 
+
+def wedge_text(w):
+    if w.get('bias')=='bearish': return ("Rising Wedge · " + ("BROKE DOWN" if w.get('confirmed') else "SETUP") + " → LONG","green")
+    if w.get('bias')=='bullish': return ("Falling Wedge · " + ("BROKE UP" if w.get('confirmed') else "SETUP") + " → SHORT","red")
+    return "אין יתד 12H פעילה","white"
+
+def reversal_text(r):
+    d=r.get('direction','none'); stg=r.get('stage','NONE')
+    if d=='LONG': return f"{stg} · QQQ/Nasdaq LONG","green" if stg!='WATCH' else "blue"
+    if d=='SHORT': return f"{stg} · QQQ/Nasdaq SHORT","red" if stg!='WATCH' else "orange"
+    return "אין Confluence מלא","white"
+
 def srzone_text(z):
     if z['state']=='support': return f"תמיכה · {z['support_touches']} נגיעות → SHORT","red"
     if z['state']=='resistance': return f"התנגדות · {z['resistance_touches']} נגיעות → LONG","green"
@@ -1355,7 +1547,8 @@ def institutional_text(v):
 
 d1,d1c=div_text(DIV1); d4,d4c=div_text(DIV4); d12,d12c=div_text(DIV12)
 f4t,f4c=fib_text(FIB4); f12t,f12c=fib_text(FIB12)
-p1t,p1c=pat_text(PAT1); p4t,p4c=pat_text(PAT4)
+p1t,p1c=pat_text(PAT1); p4t,p4c=pat_text(PAT4); p12t,p12c=pat_text(PAT12)
+w12t,w12c=wedge_text(WEDGE12); revt,revc=reversal_text(REV12)
 sr4t,sr4c=srzone_text(SR4); sr12t,sr12c=srzone_text(SR12)
 instt,instc=institutional_text(category_scores["Institutional"])
 term_text="Risk-Off" if R3>=1.02 else ("Risk-On" if R3<=0.94 else "ניטרלי")
@@ -1366,9 +1559,13 @@ rv_text=(f"Acceleration {VIX_RV_RATIO:.2f}x" if np.isfinite(VIX_RV_RATIO) else "
 st.markdown('<div class="status-grid">'+
     status_row("Divergence 1H · FAST TRIGGER",d1,d1c)+
     status_row("Divergence 4H · MAIN SETUP",d4,d4c)+
+    status_row("Divergence 4H · EARLY",(DIV4_EARLY if DIV4=='none' else "strict already active"),"green" if DIV4_EARLY=='bearish' else ("red" if DIV4_EARLY=='bullish' else "white"))+
     status_row("Divergence 12H · BONUS",d12,d12c)+
     status_row("Pattern 1H · W/M/Wedge",p1t,p1c)+
     status_row("Pattern 4H · W/M/Wedge",p4t,p4c)+
+    status_row("Pattern 12H · CONFIRMED",p12t,p12c)+
+    status_row("Wedge 12H · EARLY SETUP",w12t,w12c)+
+    status_row("12H Reversal Confluence",revt,revc)+
     status_row("Repeated S/R · 4H",sr4t,sr4c)+
     status_row("Smart Fib · 4H",f4t,f4c)+
     status_row("Repeated S/R · 12H",sr12t,sr12c)+
@@ -1389,15 +1586,23 @@ for tf,f,z in [("4H",FIB4,SR4),("12H",FIB12,SR12)]:
         st.markdown(f'<div class="panel"><b>Smart Fib {tf} {arrow}</b><br>Impulse: <bdi dir="ltr">{f["start"]:.2f} → {f["end"]:.2f}</bdi> · אזור <bdi dir="ltr">0.50–0.618 = {f["zone_low"]:.2f}–{f["zone_high"]:.2f}</bdi><br>VIX <bdi dir="ltr">{f["current"]:.2f}</bdi> · {ft} · {zone_note}<br><span class="muted">Fib הוא כלי תיקון/המשך: מחפשים Impulse, תיקון ל-0.50–0.618 ואז חזרה למגמה הקודמת. מעבר 0.618 אינו פריצה ואינו אות כניסה. נדרש אישור נוסף.</span></div>',unsafe_allow_html=True)
 
 # Minimal execution reminder
-if "SHORT" in state: action="חפש טריגר SHORT קצר ב-QQQ/Nasdaq; זה אינו אישור כניסה אוטומטי"
+if state.startswith("ENTRY READY"):
+    action=f"{state} — יש אישור 12H+4H; עדיין הגדר Entry/SL לפי המחיר בזמן אמת"
+elif state.startswith("DEVELOPING"):
+    action=f"{state} — הסטאפ מתחזק; המתן ל-4H continuation/retest לפני Entry"
+elif state.startswith("WATCH"):
+    action=f"{state} — התראה מוקדמת; עדיין לא Entry"
+elif "SHORT" in state: action="חפש טריגר SHORT קצר ב-QQQ/Nasdaq; זה אינו אישור כניסה אוטומטי"
 elif "LONG" in state: action="חפש טריגר LONG קצר ב-QQQ/Nasdaq; זה אינו אישור כניסה אוטומטי"
 else: action="אין עסקה — המתן לסנכרון"
 st.markdown(f'<div class="panel" style="text-align:center;font-weight:900">{action}</div>',unsafe_allow_html=True)
 
 with st.expander("פירוט החישוב"):
-    st.write("**מבנה v11.1:** Divergence 1H+4H הוא הליבה; 12H בונוס. Fib נבדק ב-4H/12H ורק עם אישורים. תבניות W/M/יתד נבדקות ב-1H/4H. אין יותר Market Confirmation ואין EMA.")
+    st.write("**מבנה v11.2:** 4H נשאר Setup מרכזי, אבל 12H Reversal Confluence יכול לייצר WATCH מוקדם משילוב S/R רב-נגיעות + Fib + Wedge. Rejection/4H Divergence מעלים ל-DEVELOPING; רק 4H follow-through/structure יכול להעלות ל-ENTRY READY. אין Market Confirmation ואין EMA.")
     st.write(f"Divergence: 1H={DIV1} · 4H={DIV4} · 12H={DIV12}")
-    st.write(f"Pattern: 1H={PAT1['pattern']} ({PAT1['bias']}) · 4H={PAT4['pattern']} ({PAT4['bias']})")
+    st.write(f"Pattern: 1H={PAT1['pattern']} ({PAT1['bias']}) · 4H={PAT4['pattern']} ({PAT4['bias']}) · 12H={PAT12['pattern']} ({PAT12['bias']})")
+    st.write(f"12H Wedge Early: {WEDGE12['pattern']} ({WEDGE12['bias']}) · confirmed={WEDGE12['confirmed']} · Reversal={REV12['stage']} {REV12['direction']}")
+    st.write(f"4H Early Divergence: {DIV4_EARLY}")
     st.write(f"Repeated S/R 4H: {SR4['state']} · support touches={SR4['support_touches']} · resistance touches={SR4['resistance_touches']}")
     st.write(f"Repeated S/R 12H: {SR12['state']} · support touches={SR12['support_touches']} · resistance touches={SR12['resistance_touches']}")
     if FIB4.get('valid'): st.write(f"Smart Fib 4H: {FIB4['direction']} · {FIB4['phase']} · zone {FIB4['zone_low']:.2f}–{FIB4['zone_high']:.2f}")
@@ -1431,4 +1636,4 @@ with st.expander("מקורות נתונים / גיבוי"):
     st.write(f"VIX OHLC 60m: **{source_name(vo_intra)}**")
     st.caption("גיבוי אמיתי: Yahoo/yfinance → Yahoo Chart API ישיר → Cboe הרשמי למדדי תנודתיות/אופציות. FRED משמש ל-VIX/VIX3M במידת הצורך. רכיב Institutional הוא אופציונלי: מקור חסר מוריד Data Coverage ואינו מוחלף בנתון מומצא.")
 
-st.caption(f"עודכן {pd.Timestamp.now(tz='Asia/Jerusalem').strftime('%H:%M')} · v11.1 Precision Continuation · שעון ישראל · Multi-Source + Retry פעיל · כלי מחקרי, לא ייעוץ השקעות")
+st.caption(f"עודכן {pd.Timestamp.now(tz='Asia/Jerusalem').strftime('%H:%M')} · v11.2 12H Reversal Confluence · שעון ישראל · Multi-Source + Retry פעיל · כלי מחקרי, לא ייעוץ השקעות")
