@@ -986,15 +986,113 @@ def four_hour_followthrough(df, direction):
         return bool(c.iloc[-1]>c.iloc[-2] and c.iloc[-1]>=h.iloc[-3:-1].max()*0.998)
     return False
 
+def atr_series(df, n=14):
+    """Closed-bar ATR used only by the execution layer."""
+    x=clean_history(df)
+    if x is None or len(x)<n+2:
+        return pd.Series(dtype=float)
+    prev=x['Close'].shift(1)
+    tr=pd.concat([(x['High']-x['Low']).abs(),(x['High']-prev).abs(),(x['Low']-prev).abs()],axis=1).max(axis=1)
+    return tr.rolling(n).mean()
+
+
+def fast_continuation_setup(qqq1h, qqq4h, vix1h, vix4h, direction):
+    """Second-chance execution layer after VIX has already established direction.
+
+    QQQ never creates the direction and never adds points to the core score. The
+    layer waits for a controlled 1H QQQ pullback, a closed-candle resumption and an
+    inverse 1H VIX confirmation. A no-chase gate rejects extended late entries.
+    """
+    out={"stage":"OFF","direction":direction or "none","detail":"אין כיוון VIX מאושר",
+         "entry":np.nan,"stop":np.nan,"tp1":np.nan,"tp2":np.nan,"atr":np.nan,
+         "risk_pct":np.nan,"tp1_pct":np.nan,"tp2_pct":np.nan,"rr1":np.nan,"rr2":np.nan,
+         "pullback_atr":np.nan,"extended":False,"vix_confirm":False,"htf_confirm":False}
+    if direction not in ('LONG','SHORT'):
+        return out
+    q1=clean_history(qqq1h); q4=clean_history(qqq4h); v1=clean_history(vix1h); v4=clean_history(vix4h)
+    if q1 is None or q4 is None or v1 is None or v4 is None or len(q1)<25 or len(q4)<8 or len(v1)<20 or len(v4)<8:
+        out.update(stage="UNAVAILABLE",detail="נתוני QQQ/VIX סגורים אינם מספיקים לשכבת Fast Continuation")
+        return out
+
+    atrs=atr_series(q1,14)
+    if len(atrs)==0 or not np.isfinite(atrs.iloc[-1]) or atrs.iloc[-1]<=0:
+        out.update(stage="UNAVAILABLE",detail="ATR של QQQ אינו זמין")
+        return out
+    atr=float(atrs.iloc[-1]); out['atr']=atr
+    qc=q1['Close']; qh=q1['High']; ql=q1['Low']; q4c=q4['Close']; vc=v1['Close']; v4c=v4['Close']
+    qr=rsi_series(qc,14); vr=rsi_series(vc,14)
+    if pd.isna(qr.iloc[-1]) or pd.isna(vr.iloc[-1]):
+        out.update(stage="UNAVAILABLE",detail="RSI 1H עדיין לא זמין")
+        return out
+
+    if direction=='LONG':
+        htf=bool(q4c.iloc[-1]>q4c.iloc[-3] and v4c.iloc[-1]<v4c.iloc[-3])
+        counter=bool((qc.diff().iloc[-5:-1] < 0).any())
+        prior_close=qc.iloc[-6:-1]
+        pre_high=float(prior_close.max()); pull=float(qc.iloc[-4:-1].min())
+        pb_depth=(pre_high-pull)/atr
+        resume=bool(qc.iloc[-1]>qc.iloc[-2] and qc.iloc[-1]>=qh.iloc[-2]*0.999 and qr.iloc[-1]>=50 and qr.iloc[-1]>qr.iloc[-2])
+        vix_ok=bool(vc.iloc[-1]<vc.iloc[-2] and vr.iloc[-1]<=55 and vr.iloc[-1]<=vr.iloc[-2]+0.5)
+        extension=abs(float(qc.iloc[-1]-qc.iloc[-2]))/atr
+        entry=float(qc.iloc[-1]); stop=float(q1['Low'].iloc[-4:].min()-0.10*atr)
+        risk=entry-stop
+        if risk<0.28*atr:
+            stop=entry-0.28*atr; risk=entry-stop
+        tp1=entry+max(0.65*atr,1.05*risk); tp2=entry+max(0.95*atr,1.55*risk)
+    else:
+        htf=bool(q4c.iloc[-1]<q4c.iloc[-3] and v4c.iloc[-1]>v4c.iloc[-3])
+        counter=bool((qc.diff().iloc[-5:-1] > 0).any())
+        prior_close=qc.iloc[-6:-1]
+        pre_low=float(prior_close.min()); pull=float(qc.iloc[-4:-1].max())
+        pb_depth=(pull-pre_low)/atr
+        resume=bool(qc.iloc[-1]<qc.iloc[-2] and qc.iloc[-1]<=ql.iloc[-2]*1.001 and qr.iloc[-1]<=50 and qr.iloc[-1]<qr.iloc[-2])
+        vix_ok=bool(vc.iloc[-1]>vc.iloc[-2] and vr.iloc[-1]>=45 and vr.iloc[-1]>=vr.iloc[-2]-0.5)
+        extension=abs(float(qc.iloc[-1]-qc.iloc[-2]))/atr
+        entry=float(qc.iloc[-1]); stop=float(q1['High'].iloc[-4:].max()+0.10*atr)
+        risk=stop-entry
+        if risk<0.28*atr:
+            stop=entry+0.28*atr; risk=stop-entry
+        tp1=entry-max(0.65*atr,1.05*risk); tp2=entry-max(0.95*atr,1.55*risk)
+
+    out['htf_confirm']=htf; out['vix_confirm']=vix_ok; out['pullback_atr']=float(pb_depth)
+    pullback_ok=counter and 0.22<=pb_depth<=1.60
+    too_wide=(risk>0.90*atr)
+    too_extended=(extension>0.80)
+    out['extended']=bool(too_wide or too_extended)
+
+    if not htf:
+        out.update(stage="WAIT",detail="הכיוון הראשי קיים, אבל QQQ 4H ו-VIX 4H עדיין לא מסונכרנים להמשך")
+        return out
+    if not pullback_ok:
+        out.update(stage="WAIT",detail="אין כרגע Pullback 1H נקי מספיק; לא רודפים אחרי המחיר")
+        return out
+    if not resume:
+        out.update(stage="WATCH",detail=f"Pullback 1H קיים ({pb_depth:.2f} ATR) · מחכים לנר חידוש בכיוון {direction}")
+        return out
+    if not vix_ok:
+        out.update(stage="WATCH",detail="QQQ מנסה לחדש מומנטום, אבל VIX 1H עדיין לא מאשר את הכיוון ההפוך")
+        return out
+    if too_wide or too_extended:
+        out.update(stage="NO_CHASE",detail="הטריגר הגיע אבל המחיר כבר נמתח/הסטופ רחב מדי — מחכים ל-Pullback נוסף")
+        return out
+
+    risk_pct=abs(entry-stop)/entry*100
+    tp1_pct=abs(tp1-entry)/entry*100; tp2_pct=abs(tp2-entry)/entry*100
+    rr1=abs(tp1-entry)/abs(entry-stop) if abs(entry-stop)>0 else np.nan
+    rr2=abs(tp2-entry)/abs(entry-stop) if abs(entry-stop)>0 else np.nan
+    out.update(stage="ENTRY_READY",detail="FAST CONTINUATION: Pullback + חידוש 1H + VIX inverse confirmation",
+               entry=entry,stop=stop,tp1=tp1,tp2=tp2,risk_pct=risk_pct,tp1_pct=tp1_pct,tp2_pct=tp2_pct,rr1=rr1,rr2=rr2)
+    return out
+
 def status_row(name,value,cls="white"):
     return f'<div class="status"><div class="status-name"><bdi>{name}</bdi></div><div class="status-val {cls}"><bdi>{value}</bdi></div></div>'
 
-st.markdown('<div class="hero"><div class="hero-title">🎯 VIX Tactical</div><div class="muted">עסקאות קצרות · 1H טריגר · 4H אישור · 12H Reversal Engine · v11.2</div></div>',unsafe_allow_html=True)
+st.markdown('<div class="hero"><div class="hero-title">🎯 VIX Tactical</div><div class="muted">עסקאות קצרות · 1H טריגר · 4H אישור · 12H Reversal + Fast Continuation · v11.3</div></div>',unsafe_allow_html=True)
 if st.button("🔄 רענן",use_container_width=True): st.cache_data.clear(); st.rerun()
 
-st.markdown('<div class="panel" dir="rtl"><bdi dir="ltr">LONG</bdi> — חיפוש עלייה ב-QQQ/Nasdaq · <bdi dir="ltr">SHORT</bdi> — חיפוש ירידה ב-QQQ/Nasdaq<br><span class="muted">אין יותר ניקוד או אישור מה-Nasdaq/S&P עצמם. הכיוון נגזר מה-VIX בלבד.</span></div>', unsafe_allow_html=True)
+st.markdown('<div class="panel" dir="rtl"><bdi dir="ltr">LONG</bdi> — חיפוש עלייה ב-QQQ/Nasdaq · <bdi dir="ltr">SHORT</bdi> — חיפוש ירידה ב-QQQ/Nasdaq<br><span class="muted">הכיוון הראשי עדיין נגזר מה-VIX בלבד. נתוני QQQ אינם מוסיפים ניקוד לכיוון; הם משמשים רק לתזמון FAST CONTINUATION / LATE ENTRY לאחר שכיוון כבר אושר.</span></div>', unsafe_allow_html=True)
 with st.expander("איך לקרוא את האיתות והזמנים"):
-    st.markdown('<div dir="rtl">המודל מיועד לסקאלפ/עסקאות קצרות: <bdi dir="ltr">4H</bdi> הוא גרף ה-Setup המרכזי, <bdi dir="ltr">1H</bdi> משמש לתזמון, ו-<bdi dir="ltr">12H</bdi> מפעיל גם מנוע Reversal Confluence. שילוב של S/R רב-נגיעות + Fib + יתד + דחייה יכול להעלות WATCH עוד לפני Entry. החישוב משתמש בנרות סגורים בלבד. סיכומי 4H/12H נוצרים מנתוני שעה זמינים ולכן הם סיכומי סשן ולא נרות בורסה מקוריים.</div>',unsafe_allow_html=True)
+    st.markdown('<div dir="rtl">המודל מיועד לסקאלפ/עסקאות קצרות: <bdi dir="ltr">4H</bdi> הוא גרף ה-Setup המרכזי, <bdi dir="ltr">1H</bdi> משמש לתזמון, ו-<bdi dir="ltr">12H</bdi> מפעיל גם מנוע Reversal Confluence. שילוב של S/R רב-נגיעות + Fib + יתד + דחייה יכול להעלות WATCH עוד לפני Entry. ב-v11.3 נוסף <bdi dir="ltr">FAST CONTINUATION / LATE ENTRY</bdi>: אחרי שהכיוון כבר אושר, QQQ משמש רק כשכבת ביצוע כדי לחפש Pullback קטן וחידוש מומנטום במקום לרדוף אחרי המחיר. החישוב משתמש בנרות סגורים בלבד. סיכומי 4H/12H נוצרים מנתוני שעה זמינים ולכן הם סיכומי סשן ולא נרות בורסה מקוריים.</div>',unsafe_allow_html=True)
 
 with st.spinner("בודק נתוני VIX ומחשב… מקור שאינו מגיב עלול להאריך את הטעינה"):
     v=fetch_close("^VIX",period="6mo")
@@ -1009,6 +1107,8 @@ with st.spinner("בודק נתוני VIX ומחשב… מקור שאינו מג�
     v6=fetch_close("^VIX6M",period="6mo")
     v1y=fetch_close("^VIX1Y",period="6mo")
     dspx=fetch_close("DSPX",period="6mo")
+    # v11.3: QQQ is optional and used ONLY for fast execution timing after VIX direction is established.
+    qqq_intra=fetch_ohlc("QQQ",period="60d",interval="60m")
 
 # Revalidate cached frames as the session changes.
 v, v9, v3, vv, v1, skew, cor1m = [
@@ -1038,6 +1138,12 @@ VO1H=closed_session_hourly(vo_intra)
 V1H=VO1H["Close"] if VO1H is not None else None
 V4=resample_close(v_intra,4); V12=resample_close(v_intra,12)
 VO4=resample_ohlc(vo_intra,4); VO12=resample_ohlc(vo_intra,12)
+# Optional QQQ execution bars. Failure here must never disable the core VIX model.
+if qqq_intra is not None and _valid_history(qqq_intra,"60d","60m"):
+    QQQ1H=closed_session_hourly(qqq_intra)
+    QQQ4=resample_ohlc(qqq_intra,4)
+else:
+    QQQ1H=None; QQQ4=None
 if (V1H is None or len(V1H)<35 or VO1H is None or len(VO1H)<35 or V4 is None or len(V4)<30 or V12 is None or len(V12)<25 or VO4 is None or len(VO4)<20 or VO12 is None or len(VO12)<18
     or V4.index[-1] != latest_bucket_start(4,obj=v_intra)
     or V12.index[-1] != latest_bucket_start(12,obj=v_intra)):
@@ -1431,6 +1537,17 @@ elif rev_stage=='WATCH' and not core_conflict and (rev_agrees or signal_score<EN
 elif rev_stage in ('WATCH','DEVELOPING','ENTRY_READY') and core_conflict:
     state,icon,cls=f"WATCH · {rev_dir} · MIXED","⚠️","yellow"
 
+# v11.3 Fast Continuation / Late Entry: only after a clear VIX direction already exists.
+fast_direction='none'
+if not core_conflict:
+    if rev_stage in ('DEVELOPING','ENTRY_READY') and rev_dir in ('LONG','SHORT'):
+        fast_direction=rev_dir
+    elif signed_signal<=-ENTRY_THRESHOLD:
+        fast_direction='LONG'
+    elif signed_signal>=ENTRY_THRESHOLD:
+        fast_direction='SHORT'
+FAST_CONT=fast_continuation_setup(QQQ1H,QQQ4,VO1H,VO4,fast_direction)
+
 pos = max(2, min(98, (signed_signal+10)/20*100))
 if state.startswith("WAIT"):
     lean = "SHORT" if signed_signal > 0 else ("LONG" if signed_signal < 0 else "NEUTRAL")
@@ -1451,6 +1568,17 @@ st.markdown(f"""
   </div>
 </div>
 """, unsafe_allow_html=True)
+
+# Dedicated second-chance execution card. It never overrides the primary VIX signal.
+fc_stage=FAST_CONT.get('stage','OFF'); fc_dir=FAST_CONT.get('direction','none')
+if fc_stage=='ENTRY_READY':
+    st.markdown(f"""<div class="panel" dir="rtl" style="border:1px solid #2d8f68"><b>⚡ FAST CONTINUATION / LATE ENTRY · {fc_dir}</b><br>
+    QQQ Entry (סגירת 1H): <bdi dir="ltr">{FAST_CONT['entry']:.2f}</bdi> · Stop: <bdi dir="ltr">{FAST_CONT['stop']:.2f}</bdi> ({FAST_CONT['risk_pct']:.2f}%)<br>
+    TP1: <bdi dir="ltr">{FAST_CONT['tp1']:.2f}</bdi> ({FAST_CONT['tp1_pct']:.2f}%, R:R {FAST_CONT['rr1']:.2f}) · TP2: <bdi dir="ltr">{FAST_CONT['tp2']:.2f}</bdi> ({FAST_CONT['tp2_pct']:.2f}%, R:R {FAST_CONT['rr2']:.2f})<br>
+    <span class="muted">עסקת המשך מהירה בלבד — כמה שעות ועד יום מסחר אחד. הכיוון מגיע מה-VIX; QQQ משמש לתזמון. אם אין Fill קרוב לטריגר או שהמחיר נמתח, לא רודפים.</span></div>""",unsafe_allow_html=True)
+elif fc_stage in ('WATCH','NO_CHASE','WAIT','UNAVAILABLE'):
+    badge={'WATCH':'👀','NO_CHASE':'⛔','WAIT':'⏳','UNAVAILABLE':'⚪'}.get(fc_stage,'⚪')
+    st.markdown(f'<div class="panel" dir="rtl"><b>{badge} FAST CONTINUATION · {fc_stage}</b><br>{FAST_CONT.get("detail","")}<br><span class="muted">מצב משני בלבד; אינו משנה את האיתות הראשי.</span></div>',unsafe_allow_html=True)
 
 
 # Freshness diagnostic: highlights unusually old derived bars.
@@ -1535,6 +1663,14 @@ def reversal_text(r):
     if d=='SHORT': return f"{stg} · QQQ/Nasdaq SHORT","red" if stg!='WATCH' else "orange"
     return "אין Confluence מלא","white"
 
+def fast_text(f):
+    stg=f.get('stage','OFF'); d=f.get('direction','none')
+    if stg=='ENTRY_READY': return f"ENTRY READY · {d}","green" if d=='LONG' else "red"
+    if stg=='WATCH': return f"WATCH · {d}","blue"
+    if stg=='NO_CHASE': return "NO CHASE · חכה ל-Pullback נוסף","yellow"
+    if stg=='UNAVAILABLE': return "לא זמין","white"
+    return "WAIT · אין Late Entry נקי","white"
+
 def srzone_text(z):
     if z['state']=='support': return f"תמיכה · {z['support_touches']} נגיעות → SHORT","red"
     if z['state']=='resistance': return f"התנגדות · {z['resistance_touches']} נגיעות → LONG","green"
@@ -1549,6 +1685,7 @@ d1,d1c=div_text(DIV1); d4,d4c=div_text(DIV4); d12,d12c=div_text(DIV12)
 f4t,f4c=fib_text(FIB4); f12t,f12c=fib_text(FIB12)
 p1t,p1c=pat_text(PAT1); p4t,p4c=pat_text(PAT4); p12t,p12c=pat_text(PAT12)
 w12t,w12c=wedge_text(WEDGE12); revt,revc=reversal_text(REV12)
+fastt,fastc=fast_text(FAST_CONT)
 sr4t,sr4c=srzone_text(SR4); sr12t,sr12c=srzone_text(SR12)
 instt,instc=institutional_text(category_scores["Institutional"])
 term_text="Risk-Off" if R3>=1.02 else ("Risk-On" if R3<=0.94 else "ניטרלי")
@@ -1566,6 +1703,7 @@ st.markdown('<div class="status-grid">'+
     status_row("Pattern 12H · CONFIRMED",p12t,p12c)+
     status_row("Wedge 12H · EARLY SETUP",w12t,w12c)+
     status_row("12H Reversal Confluence",revt,revc)+
+    status_row("FAST CONTINUATION / LATE ENTRY",fastt,fastc)+
     status_row("Repeated S/R · 4H",sr4t,sr4c)+
     status_row("Smart Fib · 4H",f4t,f4c)+
     status_row("Repeated S/R · 12H",sr12t,sr12c)+
@@ -1586,7 +1724,9 @@ for tf,f,z in [("4H",FIB4,SR4),("12H",FIB12,SR12)]:
         st.markdown(f'<div class="panel"><b>Smart Fib {tf} {arrow}</b><br>Impulse: <bdi dir="ltr">{f["start"]:.2f} → {f["end"]:.2f}</bdi> · אזור <bdi dir="ltr">0.50–0.618 = {f["zone_low"]:.2f}–{f["zone_high"]:.2f}</bdi><br>VIX <bdi dir="ltr">{f["current"]:.2f}</bdi> · {ft} · {zone_note}<br><span class="muted">Fib הוא כלי תיקון/המשך: מחפשים Impulse, תיקון ל-0.50–0.618 ואז חזרה למגמה הקודמת. מעבר 0.618 אינו פריצה ואינו אות כניסה. נדרש אישור נוסף.</span></div>',unsafe_allow_html=True)
 
 # Minimal execution reminder
-if state.startswith("ENTRY READY"):
+if FAST_CONT.get('stage')=='ENTRY_READY':
+    action=f"FAST CONTINUATION {FAST_CONT.get('direction')} — כניסה מאוחרת מבוקרת אחרי Pullback; יעד לעסקה של שעות ועד יום, בלי לרדוף"
+elif state.startswith("ENTRY READY"):
     action=f"{state} — יש אישור 12H+4H; עדיין הגדר Entry/SL לפי המחיר בזמן אמת"
 elif state.startswith("DEVELOPING"):
     action=f"{state} — הסטאפ מתחזק; המתן ל-4H continuation/retest לפני Entry"
@@ -1598,11 +1738,13 @@ else: action="אין עסקה — המתן לסנכרון"
 st.markdown(f'<div class="panel" style="text-align:center;font-weight:900">{action}</div>',unsafe_allow_html=True)
 
 with st.expander("פירוט החישוב"):
-    st.write("**מבנה v11.2:** 4H נשאר Setup מרכזי, אבל 12H Reversal Confluence יכול לייצר WATCH מוקדם משילוב S/R רב-נגיעות + Fib + Wedge. Rejection/4H Divergence מעלים ל-DEVELOPING; רק 4H follow-through/structure יכול להעלות ל-ENTRY READY. אין Market Confirmation ואין EMA.")
+    st.write("**מבנה v11.3:** 4H נשאר Setup מרכזי ו-12H Reversal Confluence מייצר WATCH/DEVELOPING/ENTRY READY. שכבת FAST CONTINUATION נפתחת רק לאחר שכיוון כבר אושר; היא בודקת QQQ 4H/1H + VIX הפוך, Pullback מבוקר, חידוש מומנטום ו-No-Chase. QQQ אינו מוסיף ניקוד לכיוון הראשי ואין EMA.")
     st.write(f"Divergence: 1H={DIV1} · 4H={DIV4} · 12H={DIV12}")
     st.write(f"Pattern: 1H={PAT1['pattern']} ({PAT1['bias']}) · 4H={PAT4['pattern']} ({PAT4['bias']}) · 12H={PAT12['pattern']} ({PAT12['bias']})")
     st.write(f"12H Wedge Early: {WEDGE12['pattern']} ({WEDGE12['bias']}) · confirmed={WEDGE12['confirmed']} · Reversal={REV12['stage']} {REV12['direction']}")
     st.write(f"4H Early Divergence: {DIV4_EARLY}")
+    st.write(f"Fast Continuation: {FAST_CONT.get('stage')} {FAST_CONT.get('direction')} · {FAST_CONT.get('detail')}")
+    if FAST_CONT.get('stage')=='ENTRY_READY': st.write(f"QQQ fast plan: Entry {FAST_CONT['entry']:.2f} · SL {FAST_CONT['stop']:.2f} · TP1 {FAST_CONT['tp1']:.2f} · TP2 {FAST_CONT['tp2']:.2f}")
     st.write(f"Repeated S/R 4H: {SR4['state']} · support touches={SR4['support_touches']} · resistance touches={SR4['resistance_touches']}")
     st.write(f"Repeated S/R 12H: {SR12['state']} · support touches={SR12['support_touches']} · resistance touches={SR12['resistance_touches']}")
     if FIB4.get('valid'): st.write(f"Smart Fib 4H: {FIB4['direction']} · {FIB4['phase']} · zone {FIB4['zone_low']:.2f}–{FIB4['zone_high']:.2f}")
@@ -1634,6 +1776,7 @@ with st.expander("מקורות נתונים / גיבוי"):
     st.write(f"DSPX Daily: **{source_name(dspx)}**")
     st.write(f"VIX Close 60m: **{source_name(v_intra)}**")
     st.write(f"VIX OHLC 60m: **{source_name(vo_intra)}**")
+    st.write(f"QQQ OHLC 60m (Fast Execution only): **{source_name(qqq_intra)}**")
     st.caption("גיבוי אמיתי: Yahoo/yfinance → Yahoo Chart API ישיר → Cboe הרשמי למדדי תנודתיות/אופציות. FRED משמש ל-VIX/VIX3M במידת הצורך. רכיב Institutional הוא אופציונלי: מקור חסר מוריד Data Coverage ואינו מוחלף בנתון מומצא.")
 
-st.caption(f"עודכן {pd.Timestamp.now(tz='Asia/Jerusalem').strftime('%H:%M')} · v11.2 12H Reversal Confluence · שעון ישראל · Multi-Source + Retry פעיל · כלי מחקרי, לא ייעוץ השקעות")
+st.caption(f"עודכן {pd.Timestamp.now(tz='Asia/Jerusalem').strftime('%H:%M')} · v11.3 Fast Continuation / Late Entry · שעון ישראל · Multi-Source + Retry פעיל · כלי מחקרי, לא ייעוץ השקעות")
