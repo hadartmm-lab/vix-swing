@@ -624,7 +624,7 @@ def detect_divergence(s, lookback=45, pivot=2, min_sep=3, min_price_pct=0.7, min
         if valid_pair(a, b):
             price_change = (x.iloc[b] / x.iloc[a] - 1) * 100
             rsi_change = float(r.iloc[b] - r.iloc[a])
-            if price_change <= -min_price_pct and rsi_change >= min_rsi_delta:
+            if price_change <= -min_price_pct and rsi_change >= min_rsi_delta and x.iloc[-1]>=x.iloc[b]:
                 return "bullish"
 
     # Bearish divergence on VIX: higher VIX high + lower RSI high -> supports VIX fade / QQQ long.
@@ -633,7 +633,7 @@ def detect_divergence(s, lookback=45, pivot=2, min_sep=3, min_price_pct=0.7, min
         if valid_pair(a, b):
             price_change = (x.iloc[b] / x.iloc[a] - 1) * 100
             rsi_change = float(r.iloc[b] - r.iloc[a])
-            if price_change >= min_price_pct and rsi_change <= -min_rsi_delta:
+            if price_change >= min_price_pct and rsi_change <= -min_rsi_delta and x.iloc[-1]<=x.iloc[b]:
                 return "bearish"
 
     return "none"
@@ -726,7 +726,10 @@ def smart_fib_state(df, lookback=55, pivot=2, min_impulse_pct=7.0):
         level618=end-0.618*rng
     zone_low=min(level50,level618); zone_high=max(level50,level618)
     cur=float(x['Close'].iloc[-1]); prev=float(x['Close'].iloc[-2])
-    recent=x.iloc[-3:]
+    if (direction=='up' and cur<=start) or (direction=='down' and cur>=start):
+        return empty
+    move=abs(end-start)/start*100
+    recent=x.iloc[max(end_i+1,len(x)-3):]
     mom=cur-float(x['Close'].iloc[-3])
     tol=max(0.04,0.015*rng)
     break_buf=max(0.03,0.008*rng)
@@ -735,7 +738,7 @@ def smart_fib_state(df, lookback=55, pivot=2, min_impulse_pct=7.0):
     if direction=='down':
         touched=float(recent['High'].max()) >= zone_low-tol
         if cur < zone_low-tol:
-            phase='approaching_up' if mom>0 else 'below_zone'
+            phase='reject_down' if touched and cur<prev and mom<0 else ('approaching_up' if mom>0 else 'below_zone')
         elif cur <= zone_high+tol:
             phase='reject_down' if touched and cur<prev and mom<0 else 'decision_zone'
         else:
@@ -745,7 +748,7 @@ def smart_fib_state(df, lookback=55, pivot=2, min_impulse_pct=7.0):
     else:
         touched=float(recent['Low'].min()) <= zone_high+tol
         if cur > zone_high+tol:
-            phase='approaching_down' if mom<0 else 'above_zone'
+            phase='rebound_up' if touched and cur>prev and mom>0 else ('approaching_down' if mom<0 else 'above_zone')
         elif cur >= zone_low-tol:
             phase='rebound_up' if touched and cur>prev and mom>0 else 'decision_zone'
         else:
@@ -778,8 +781,8 @@ def repeated_sr_zone(df, lookback=50, pivot=2, tol_pct=1.2, min_touches=3):
     for i in range(pivot,len(x)-pivot):
         wh=x['High'].iloc[i-pivot:i+pivot+1]
         wl=x['Low'].iloc[i-pivot:i+pivot+1]
-        if x['High'].iloc[i]==wh.max(): highs.append(float(x['High'].iloc[i]))
-        if x['Low'].iloc[i]==wl.min(): lows.append(float(x['Low'].iloc[i]))
+        if x['High'].iloc[i]==wh.max() and (wh==x['High'].iloc[i]).sum()==1: highs.append(float(x['High'].iloc[i]))
+        if x['Low'].iloc[i]==wl.min() and (wl==x['Low'].iloc[i]).sum()==1: lows.append(float(x['Low'].iloc[i]))
 
     def best_cluster(vals):
         if len(vals)<min_touches: return (np.nan,0)
@@ -821,7 +824,7 @@ def detect_clear_pattern(df, lookback=42, pivot=2):
     # Confirmed M: two similar highs, meaningful valley, then close below neckline.
     if len(highs)>=2:
         h1,h2=highs[-2],highs[-1]
-        if h2[0]-h1[0]>=4:
+        if h2[0]-h1[0]>=4 and len(x)-1-h2[0]<=8:
             between=x['Low'].iloc[h1[0]:h2[0]+1]
             neckline=float(between.min())
             peak_avg=(h1[1]+h2[1])/2
@@ -831,7 +834,7 @@ def detect_clear_pattern(df, lookback=42, pivot=2):
     # Confirmed W: two similar lows, meaningful middle peak, then close above neckline.
     if len(lows)>=2:
         l1,l2=lows[-2],lows[-1]
-        if l2[0]-l1[0]>=4:
+        if l2[0]-l1[0]>=4 and len(x)-1-l2[0]<=8:
             between=x['High'].iloc[l1[0]:l2[0]+1]
             neckline=float(between.max())
             low_avg=(l1[1]+l2[1])/2
@@ -852,7 +855,7 @@ def detect_clear_pattern(df, lookback=42, pivot=2):
         converging=width_old>0 and width_now>0 and width_now<=width_old*0.82
         if converging and hs>0 and ls>0 and ls>hs and close<lower_now*0.998:
             return {"pattern":"Bearish Wedge","bias":"bearish","detail":"יתד עולה/דובית מאושרת בשבירה מטה"}
-        if converging and hs<0 and ls<0 and hs>ls and close>upper_now*1.002:
+        if converging and hs<0 and ls<0 and hs<ls and close>upper_now*1.002:
             return {"pattern":"Bullish Wedge","bias":"bullish","detail":"יתד יורדת/שורית מאושרת בפריצה מעלה"}
     return out
 
@@ -895,7 +898,7 @@ def detect_wedge_setup(df, lookback=55, pivot=2):
         confirmed=close<lower_now*0.998
         return {"pattern":"Rising Wedge","bias":"bearish","confirmed":bool(confirmed),
                 "detail":"יתד עולה/דובית " + ("מאושרת בשבירה מטה" if confirmed else "בבנייה")}
-    if converging and hs<0 and ls<0 and hs>ls:
+    if converging and hs<0 and ls<0 and hs<ls:
         confirmed=close>upper_now*1.002
         return {"pattern":"Falling Wedge","bias":"bullish","confirmed":bool(confirmed),
                 "detail":"יתד יורדת/שורית " + ("מאושרת בפריצה מעלה" if confirmed else "בבנייה")}
@@ -1014,7 +1017,11 @@ def fast_continuation_setup(qqq1h, qqq4h, vix1h, vix4h, direction):
         out.update(stage="UNAVAILABLE",detail="נתוני QQQ/VIX סגורים אינם מספיקים לשכבת Fast Continuation")
         return out
 
-    atrs=atr_series(q1,14)
+    # Require comparable source candle windows; mismatched feed phases cannot confirm each other.
+    if q1.index[-1] != v1.index[-1] or q4.index[-1] != v4.index[-1]:
+        out.update(stage="UNAVAILABLE",detail="נרות QQQ ו-VIX אינם מסונכרנים בזמן")
+        return out
+    atrs=atr_series(q1.iloc[:-1],14)
     if len(atrs)==0 or not np.isfinite(atrs.iloc[-1]) or atrs.iloc[-1]<=0:
         out.update(stage="UNAVAILABLE",detail="ATR של QQQ אינו זמין")
         return out
@@ -1057,7 +1064,8 @@ def fast_continuation_setup(qqq1h, qqq4h, vix1h, vix4h, direction):
     out['htf_confirm']=htf; out['vix_confirm']=vix_ok; out['pullback_atr']=float(pb_depth)
     pullback_ok=counter and 0.22<=pb_depth<=1.60
     too_wide=(risk>0.90*atr)
-    too_extended=(extension>0.80)
+    trigger_range=float(qh.iloc[-1]-ql.iloc[-1])/atr
+    too_extended=(extension>0.80 or trigger_range>1.50)
     out['extended']=bool(too_wide or too_extended)
 
     if not htf:
@@ -1084,15 +1092,45 @@ def fast_continuation_setup(qqq1h, qqq4h, vix1h, vix4h, direction):
                entry=entry,stop=stop,tp1=tp1,tp2=tp2,risk_pct=risk_pct,tp1_pct=tp1_pct,tp2_pct=tp2_pct,rr1=rr1,rr2=rr2)
     return out
 
+def stoch_rsi_state(close):
+    """Diagnostic only: no additional score for a derivative of the same RSI."""
+    r=rsi_series(close,14)
+    lo=r.rolling(14).min(); hi=r.rolling(14).max()
+    raw=100*(r-lo)/(hi-lo).replace(0,np.nan)
+    k=raw.rolling(3).mean(); d=k.rolling(3).mean()
+    if len(k)<2 or not np.isfinite(k.iloc[-2:]).all() or not np.isfinite(d.iloc[-2:]).all():
+        return 'N/A'
+    cross='cross up' if k.iloc[-2]<=d.iloc[-2] and k.iloc[-1]>d.iloc[-1] else ('cross down' if k.iloc[-2]>=d.iloc[-2] and k.iloc[-1]<d.iloc[-1] else 'no new cross')
+    return f'K {k.iloc[-1]:.1f} / D {d.iloc[-1]:.1f} · {cross}'
+
+
+def entry_gate(direction, div4, pattern4, fib_ok, trigger_ok, conflict):
+    expected = 'bearish' if direction == 'LONG' else 'bullish'
+    issues = []
+    if direction not in ('LONG', 'SHORT'): issues.append('אין כיוון')
+    if div4 != expected: issues.append('חסרה סטיית RSI ב-4H')
+    if pattern4 != expected: issues.append('חסרה תבנית 4H תואמת')
+    if not fib_ok: issues.append('חסרה תגובת Fib עם S/R')
+    if not trigger_ok: issues.append('חסר אישור נר 1H')
+    if conflict: issues.append('קונפליקט בין הליבה לרקע')
+    return issues
+
+
+def execution_session_open(now=None):
+    now=utc_now(now)
+    sc=schedule(now)
+    return bool(((sc['open']<=now)&(now<sc['close'])).any())
+
+
 def status_row(name,value,cls="white"):
     return f'<div class="status"><div class="status-name"><bdi>{name}</bdi></div><div class="status-val {cls}"><bdi>{value}</bdi></div></div>'
 
-st.markdown('<div class="hero"><div class="hero-title">🎯 VIX Tactical</div><div class="muted">עסקאות קצרות · 1H טריגר · 4H אישור · 12H Reversal + Fast Continuation · v11.3</div></div>',unsafe_allow_html=True)
+st.markdown('<div class="hero"><div class="hero-title">🎯 VIX Tactical</div><div class="muted">עסקאות קצרות · 1H טריגר · 4H אישור · 12H Reversal + Fast Continuation · v11.4</div></div>',unsafe_allow_html=True)
 if st.button("🔄 רענן",use_container_width=True): st.cache_data.clear(); st.rerun()
 
 st.markdown('<div class="panel" dir="rtl"><bdi dir="ltr">LONG</bdi> — חיפוש עלייה ב-QQQ/Nasdaq · <bdi dir="ltr">SHORT</bdi> — חיפוש ירידה ב-QQQ/Nasdaq<br><span class="muted">הכיוון הראשי עדיין נגזר מה-VIX בלבד. נתוני QQQ אינם מוסיפים ניקוד לכיוון; הם משמשים רק לתזמון FAST CONTINUATION / LATE ENTRY לאחר שכיוון כבר אושר.</span></div>', unsafe_allow_html=True)
 with st.expander("איך לקרוא את האיתות והזמנים"):
-    st.markdown('<div dir="rtl">המודל מיועד לסקאלפ/עסקאות קצרות: <bdi dir="ltr">4H</bdi> הוא גרף ה-Setup המרכזי, <bdi dir="ltr">1H</bdi> משמש לתזמון, ו-<bdi dir="ltr">12H</bdi> מפעיל גם מנוע Reversal Confluence. שילוב של S/R רב-נגיעות + Fib + יתד + דחייה יכול להעלות WATCH עוד לפני Entry. ב-v11.3 נוסף <bdi dir="ltr">FAST CONTINUATION / LATE ENTRY</bdi>: אחרי שהכיוון כבר אושר, QQQ משמש רק כשכבת ביצוע כדי לחפש Pullback קטן וחידוש מומנטום במקום לרדוף אחרי המחיר. החישוב משתמש בנרות סגורים בלבד. סיכומי 4H/12H נוצרים מנתוני שעה זמינים ולכן הם סיכומי סשן ולא נרות בורסה מקוריים.</div>',unsafe_allow_html=True)
+    st.markdown('<div dir="rtl">המודל מיועד לסקאלפ/עסקאות קצרות: <bdi dir="ltr">4H</bdi> הוא גרף ה-Setup המרכזי, <bdi dir="ltr">1H</bdi> משמש לתזמון, ו-<bdi dir="ltr">12H</bdi> מפעיל גם מנוע Reversal Confluence. שילוב של S/R רב-נגיעות + Fib + יתד + דחייה יכול להעלות WATCH עוד לפני Entry. ב-v11.4 נוסף <bdi dir="ltr">FAST CONTINUATION / LATE ENTRY</bdi>: אחרי שהכיוון כבר אושר, QQQ משמש רק כשכבת ביצוע כדי לחפש Pullback קטן וחידוש מומנטום במקום לרדוף אחרי המחיר. החישוב משתמש בנרות סגורים בלבד. סיכומי 4H/12H נוצרים מנתוני שעה זמינים ולכן הם סיכומי סשן ולא נרות בורסה מקוריים.</div>',unsafe_allow_html=True)
 
 with st.spinner("בודק נתוני VIX ומחשב… מקור שאינו מגיב עלול להאריך את הטעינה"):
     v=fetch_close("^VIX",period="6mo")
@@ -1107,7 +1145,7 @@ with st.spinner("בודק נתוני VIX ומחשב… מקור שאינו מג�
     v6=fetch_close("^VIX6M",period="6mo")
     v1y=fetch_close("^VIX1Y",period="6mo")
     dspx=fetch_close("DSPX",period="6mo")
-    # v11.3: QQQ is optional and used ONLY for fast execution timing after VIX direction is established.
+    # v11.4: QQQ is optional and used ONLY for fast execution timing after VIX direction is established.
     qqq_intra=fetch_ohlc("QQQ",period="60d",interval="60m")
 
 # Revalidate cached frames as the session changes.
@@ -1241,8 +1279,8 @@ FRONT_DELTA=((FRONT_NOW/FRONT_PREV)-1.0)*100 if np.isfinite(FRONT_NOW) and np.is
 
 # Realized VIX motion diagnostics from closed 1H bars: acceleration / shock persistence.
 _v1h_ret = pd.to_numeric(V1H, errors="coerce").pct_change().dropna()*100 if V1H is not None else pd.Series(dtype=float)
-VIX_RV_6H=float(_v1h_ret.iloc[-6:].std(ddof=0)*np.sqrt(6)) if len(_v1h_ret)>=6 else np.nan
-VIX_RV_24H=float(_v1h_ret.iloc[-24:].std(ddof=0)*np.sqrt(24)) if len(_v1h_ret)>=24 else np.nan
+VIX_RV_6H=float(_v1h_ret.iloc[-6:].std(ddof=0)) if len(_v1h_ret)>=6 else np.nan
+VIX_RV_24H=float(_v1h_ret.iloc[-24:].std(ddof=0)) if len(_v1h_ret)>=24 else np.nan
 VIX_RV_RATIO=(VIX_RV_6H/VIX_RV_24H) if np.isfinite(VIX_RV_6H) and np.isfinite(VIX_RV_24H) and VIX_RV_24H>0 else np.nan
 
 score=0.0; reasons=[]
@@ -1382,11 +1420,11 @@ institutional_total=2.5
 if v1 is not None and len(v1)>=20 and np.isfinite(R1) and np.isfinite(R1_9):
     institutional_available += 0.875
     if R1_9>=1.05 and R9>=1.02:
-        addcat("Institutional", 0.875,"⚡ VIX1D > VIX9D > VIX → לחץ מיידי חזק / SHORT")
+        addcat("Institutional", 0.875,"⚡ VIX1D > VIX9D > VIX → לחץ בסגירה היומית / SHORT")
     elif R1>=1.08:
         addcat("Institutional", 0.60,"⚡ VIX1D בפרמיה ל-VIX → Immediate Event Pressure / SHORT")
     elif R1_9<=0.90 and R9<=0.98:
-        addcat("Institutional",-0.875,"⚡ VIX1D < VIX9D < VIX → רגיעה מיידית חזקה / LONG")
+        addcat("Institutional",-0.875,"⚡ VIX1D < VIX9D < VIX → רגיעה בסגירה היומית / LONG")
     elif R1<=0.88:
         addcat("Institutional",-0.55,"⚡ VIX1D חלש מול VIX → Immediate Vol Relief / LONG")
 
@@ -1463,13 +1501,13 @@ if np.isfinite(R3_6):
     elif R3_6<=0.96: addcat("Regime",-0.15,"VIX3M/VIX6M steep contango → calmer medium-term curve")
 
 if np.isfinite(VIX_RV_RATIO):
-    if VIX_RV_RATIO>=1.35 and C1>0: addcat("Regime",0.30,"VIX intraday realized-vol acceleration upward → SHORT confirmation")
-    elif VIX_RV_RATIO>=1.35 and C1<0: addcat("Regime",-0.30,"VIX intraday realized-vol acceleration downward → LONG confirmation")
+    if VIX_RV_RATIO>=1.35 and pctn(V1H,6)>0: addcat("Regime",0.30,"VIX intraday realized-vol acceleration upward → SHORT confirmation")
+    elif VIX_RV_RATIO>=1.35 and pctn(V1H,6)<0: addcat("Regime",-0.30,"VIX intraday realized-vol acceleration downward → LONG confirmation")
 
 # Optional dispersion context. It is deliberately tiny: dispersion is useful for
 # separating index-wide fear from stock-specific volatility, not for timing by itself.
 DSPX5=pctn(dspx,5) if dspx is not None else np.nan
-if np.isfinite(DSPX5) and np.isfinite(C5):
+if False:  # DSPX remains informational until validated out of sample.
     spread_move=C5-DSPX5
     if spread_move>=5.0: addcat("Regime",0.15,"Index vol outruns dispersion → more systemic stress / SHORT context")
     elif spread_move<=-5.0: addcat("Regime",-0.15,"Dispersion outruns index vol → less systemic VIX pressure / LONG context")
@@ -1537,16 +1575,22 @@ elif rev_stage=='WATCH' and not core_conflict and (rev_agrees or signal_score<EN
 elif rev_stage in ('WATCH','DEVELOPING','ENTRY_READY') and core_conflict:
     state,icon,cls=f"WATCH · {rev_dir} · MIXED","⚠️","yellow"
 
-# v11.3 Fast Continuation / Late Entry: only after a clear VIX direction already exists.
-fast_direction='none'
-if not core_conflict:
-    if rev_stage in ('DEVELOPING','ENTRY_READY') and rev_dir in ('LONG','SHORT'):
-        fast_direction=rev_dir
-    elif signed_signal<=-ENTRY_THRESHOLD:
-        fast_direction='LONG'
-    elif signed_signal>=ENTRY_THRESHOLD:
-        fast_direction='SHORT'
+# v11.4: no secondary path may bypass the same mandatory core conditions.
+candidate_direction='LONG' if signed_signal<0 else ('SHORT' if signed_signal>0 else 'none')
+trigger_ok=four_hour_followthrough(VO1H,candidate_direction)
+gate_issues=entry_gate(candidate_direction,DIV4,PAT4.get('bias'),
+                       fib_is_confirmed_for('down' if candidate_direction=='LONG' else 'up'),
+                       trigger_ok,core_conflict)
+core_approved=not gate_issues and signal_score>=ENTRY_THRESHOLD
+market_open=execution_session_open()
+if not core_approved and not state.startswith(('WATCH','DEVELOPING')):
+    state,icon,cls='WAIT · חסר אישור ליבה','⚪','white'
+if not market_open:
+    state,icon,cls='WATCH · מחוץ לשעות המסחר','👀','yellow'
+fast_direction=candidate_direction if core_approved and market_open else 'none'
 FAST_CONT=fast_continuation_setup(QQQ1H,QQQ4,VO1H,VO4,fast_direction)
+st.caption('אישור ליבה: '+('תקין' if core_approved else ' · '.join(gate_issues) or 'הציון נמוך מהסף'))
+st.info('זמנים: 4H = מקטעי סשן (4 שעות ואז יתרת היום); 12H = סיכום יום מסחר רגיל בלבד, לא נר 12 שעות. נתוני VVIX/VIX1D והעקומה הם סגירות יומיות, לא לחץ חי. אין כאן חוזי VX1–VX3.')
 
 pos = max(2, min(98, (signed_signal+10)/20*100))
 if state.startswith("WAIT"):
@@ -1559,7 +1603,7 @@ st.markdown(f"""
 <div class="signal">
   <div class="signal-title {cls}">{icon} {state}</div>
   <div class="score">{score_line}</div>
-  <div class="confidence">סף חיפוש עסקה קצרה: <b>4.0/10</b> · כיסוי נתונים <b>{data_coverage:.0f}%</b></div>
+  <div class="confidence">סף חיפוש עסקה קצרה: <b>4.0/10</b> · כיסוי משוקלל של רכיבי הליבה/הרקע <b>{data_coverage:.0f}%</b></div>
   <div class="gauge-wrap">
     <div class="pointer" style="left:{pos:.1f}%"></div>
     <div class="gauge"><div class="midline"></div></div>
@@ -1677,9 +1721,9 @@ def srzone_text(z):
     return "אין אזור רב-נגיעות פעיל","white"
 
 def institutional_text(v):
-    if v>=0.45: return f"FAST Pressure {v:+.2f}/2.5 → SHORT","red"
-    if v<=-0.45: return f"FAST Relief {v:+.2f}/2.5 → LONG","green"
-    return f"FAST Neutral {v:+.2f}/2.5","white"
+    if v>=0.45: return f"Daily Pressure {v:+.2f}/2.5 → SHORT","red"
+    if v<=-0.45: return f"Daily Relief {v:+.2f}/2.5 → LONG","green"
+    return f"Daily Neutral {v:+.2f}/2.5","white"
 
 d1,d1c=div_text(DIV1); d4,d4c=div_text(DIV4); d12,d12c=div_text(DIV12)
 f4t,f4c=fib_text(FIB4); f12t,f12c=fib_text(FIB12)
@@ -1708,7 +1752,9 @@ st.markdown('<div class="status-grid">'+
     status_row("Smart Fib · 4H",f4t,f4c)+
     status_row("Repeated S/R · 12H",sr12t,sr12c)+
     status_row("Smart Fib · 12H",f12t,f12c)+
-    status_row("Institutional Fast Pressure",instt,instc)+
+    status_row("Daily Volatility Context",instt,instc)+
+    status_row("Stoch RSI · 4H (מידע בלבד)",stoch_rsi_state(V4))+
+    status_row("Stoch RSI · session context (מידע בלבד)",stoch_rsi_state(V12))+
     status_row("Setup Alignment",conflict_text,conflict_cls)+
     status_row("Volatility Regime",REGIME,regime_cls)+
     status_row("VIX Intraday RV",rv_text,"orange" if np.isfinite(VIX_RV_RATIO) and VIX_RV_RATIO>=1.35 else "white")+
@@ -1732,13 +1778,14 @@ elif state.startswith("DEVELOPING"):
     action=f"{state} — הסטאפ מתחזק; המתן ל-4H continuation/retest לפני Entry"
 elif state.startswith("WATCH"):
     action=f"{state} — התראה מוקדמת; עדיין לא Entry"
+elif state.startswith("WAIT"): action="אין עסקה — חסר אישור ליבה"
 elif "SHORT" in state: action="חפש טריגר SHORT קצר ב-QQQ/Nasdaq; זה אינו אישור כניסה אוטומטי"
 elif "LONG" in state: action="חפש טריגר LONG קצר ב-QQQ/Nasdaq; זה אינו אישור כניסה אוטומטי"
 else: action="אין עסקה — המתן לסנכרון"
 st.markdown(f'<div class="panel" style="text-align:center;font-weight:900">{action}</div>',unsafe_allow_html=True)
 
 with st.expander("פירוט החישוב"):
-    st.write("**מבנה v11.3:** 4H נשאר Setup מרכזי ו-12H Reversal Confluence מייצר WATCH/DEVELOPING/ENTRY READY. שכבת FAST CONTINUATION נפתחת רק לאחר שכיוון כבר אושר; היא בודקת QQQ 4H/1H + VIX הפוך, Pullback מבוקר, חידוש מומנטום ו-No-Chase. QQQ אינו מוסיף ניקוד לכיוון הראשי ואין EMA.")
+    st.write("**מבנה v11.4:** 4H נשאר Setup מרכזי ו-12H Reversal Confluence מייצר WATCH/DEVELOPING/ENTRY READY. שכבת FAST CONTINUATION נפתחת רק לאחר שכיוון כבר אושר; היא בודקת QQQ 4H/1H + VIX הפוך, Pullback מבוקר, חידוש מומנטום ו-No-Chase. QQQ אינו מוסיף ניקוד לכיוון הראשי ואין EMA.")
     st.write(f"Divergence: 1H={DIV1} · 4H={DIV4} · 12H={DIV12}")
     st.write(f"Pattern: 1H={PAT1['pattern']} ({PAT1['bias']}) · 4H={PAT4['pattern']} ({PAT4['bias']}) · 12H={PAT12['pattern']} ({PAT12['bias']})")
     st.write(f"12H Wedge Early: {WEDGE12['pattern']} ({WEDGE12['bias']}) · confirmed={WEDGE12['confirmed']} · Reversal={REV12['stage']} {REV12['direction']}")
@@ -1779,4 +1826,4 @@ with st.expander("מקורות נתונים / גיבוי"):
     st.write(f"QQQ OHLC 60m (Fast Execution only): **{source_name(qqq_intra)}**")
     st.caption("גיבוי אמיתי: Yahoo/yfinance → Yahoo Chart API ישיר → Cboe הרשמי למדדי תנודתיות/אופציות. FRED משמש ל-VIX/VIX3M במידת הצורך. רכיב Institutional הוא אופציונלי: מקור חסר מוריד Data Coverage ואינו מוחלף בנתון מומצא.")
 
-st.caption(f"עודכן {pd.Timestamp.now(tz='Asia/Jerusalem').strftime('%H:%M')} · v11.3 Fast Continuation / Late Entry · שעון ישראל · Multi-Source + Retry פעיל · כלי מחקרי, לא ייעוץ השקעות")
+st.caption(f"עודכן {pd.Timestamp.now(tz='Asia/Jerusalem').strftime('%H:%M')} · v11.4 Fast Continuation / Late Entry · שעון ישראל · Multi-Source + Retry פעיל · כלי מחקרי, לא ייעוץ השקעות")
